@@ -1,0 +1,16 @@
+# Build: make -f Makefile.dfind
+CC      = gcc
+CFLAGS  = -O2 -Wall
+LDLIBS  = -lext2fs -lcom_err -lntfs-3g
+
+dfind: dfind.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+# Debian/Ubuntu dev packages needed to build:
+#   sudo apt-get install libext2fs-dev ntfs-3g-dev build-essential
+#
+# Reading a raw block device generally needs root or membership of
+# the 'disk' group.
+
+clean:
+	rm -f dfind
