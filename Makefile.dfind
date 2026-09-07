@@ -1,3 +1,4 @@
+# dfind - Makefile
 # Build: make -f Makefile.dfind
 CC      = gcc
 CFLAGS  = -O2 -Wall
