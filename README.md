@@ -1,7 +1,9 @@
 # dfind
 
 changelog : 
+
 1.0 : initial release
+
 1.1 : algorithmic improvements over the standard search method, 20.29% gain in total execution time and 25.45% gain in execution speed
 
 `dfind` is a standalone file-finding tool that can enumerate files directly from filesystem metadata tables instead of relying on the normal VFS directory walk.
