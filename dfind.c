@@ -504,6 +504,65 @@ relative_to_mount (const char *fullpath, const char *mountpoint)
   return rel;
 }
 
+/* Resolves argv's PATH to a clean absolute path, the same way real
+ * find/realpath(1) would - but WITHOUT requiring the path to exist on
+ * the live tree, since -table's whole point is finding things that
+ * might only exist in the on-disk table (or that live under a path
+ * you haven't mounted the "normal" way). This absolute form is what
+ * -table mode uses for every device/mountpoint/table lookup; the
+ * previous version used the raw, possibly-relative argv string (e.g.
+ * ".") for that, which made "." resolve to the filesystem's ROOT
+ * directory instead of the caller's cwd - silently turning every
+ * `-table` search into a full-device scan. See the note at call site.
+ */
+static int
+resolve_target_path (const char *arg, char *out, size_t outsz)
+{
+  if (realpath (arg, out))
+    return 0;
+
+  /* Path doesn't exist on the live tree right now - normalize it
+   * lexically against the cwd instead of giving up. */
+  char cwd[PATH_MAX];
+  if (!getcwd (cwd, sizeof (cwd)))
+    return -1;
+
+  char combined[PATH_MAX * 2];
+  if (arg[0] == '/')
+    snprintf (combined, sizeof (combined), "%s", arg);
+  else
+    snprintf (combined, sizeof (combined), "%s/%s", cwd, arg);
+
+  /* Collapse "." and ".." components component-by-component, same
+   * idea as realpath(3) but without touching the filesystem. */
+  char *parts[PATH_MAX / 2];
+  int nparts = 0;
+  char *save = NULL;
+  char *buf = strdup (combined);
+  for (char *tok = strtok_r (buf, "/", &save); tok; tok = strtok_r (NULL, "/", &save))
+    {
+      if (!strcmp (tok, ".")) continue;
+      if (!strcmp (tok, ".."))
+        { if (nparts > 0) nparts--; continue; }
+      parts[nparts++] = tok;
+    }
+
+  size_t pos = 0;
+  out[pos++] = '/';
+  out[pos] = '\0';
+  for (int i = 0; i < nparts; i++)
+    {
+      size_t len = strlen (parts[i]);
+      if (pos + len + 2 > outsz) break;
+      if (pos > 1) out[pos++] = '/';
+      memcpy (out + pos, parts[i], len);
+      pos += len;
+      out[pos] = '\0';
+    }
+  free (buf);
+  return 0;
+}
+
 /* ================================================================== */
 /* ext2/ext3/ext4 table collection (libext2fs)                        */
 /* ================================================================== */
@@ -511,10 +570,16 @@ relative_to_mount (const char *fullpath, const char *mountpoint)
 struct ext_collect_ctx
 {
   ext2_filsys fs;
-  struct table *out;
+  struct table *out;       /* only written to when buffer_mode is set */
   char pathbuf[PATH_MAX];
   long depth;
-  const struct filters *f; /* only for maxdepth/mindepth during walk */
+  const struct filters *f;
+  time_t now;
+  int buffer_mode;         /* -dump / --cache / -empty need every row
+                             * buffered; a plain filtered search does
+                             * not, and streams matches immediately
+                             * instead so memory stays flat regardless
+                             * of how large the scanned subtree is. */
 };
 
 static void
@@ -581,8 +646,12 @@ ext_dir_iter_cb (ext2_ino_t dir_ino, int entry, struct ext2_dir_entry *dirent,
 
   if (ctx->f->mindepth < 0 || ctx->depth + 1 >= ctx->f->mindepth)
     {
-      struct table_entry *e = table_push (ctx->out);
-      fill_entry_from_ext_inode (e, ctx->fs, dirent->inode, &inode, child);
+      struct table_entry tmp;
+      fill_entry_from_ext_inode (&tmp, ctx->fs, dirent->inode, &inode, child);
+      if (ctx->buffer_mode)
+        *table_push (ctx->out) = tmp;
+      else if (matches_filters (ctx->f, &tmp, ctx->now))
+        print_entry (ctx->f, &tmp);
     }
 
   if (LINUX_S_ISDIR (inode.i_mode)
@@ -599,7 +668,8 @@ ext_dir_iter_cb (ext2_ino_t dir_ino, int entry, struct ext2_dir_entry *dirent,
 
 static int
 collect_ext_table (const struct mount_info *mi, const struct filters *filt,
-                    const char *rel_target, struct table *out)
+                    const char *rel_target, const char *display_root,
+                    struct table *out)
 {
   ext2_filsys fs;
   errcode_t rc = ext2fs_open (mi->device, 0, 0, 0, unix_io_manager, &fs);
@@ -611,6 +681,13 @@ collect_ext_table (const struct mount_info *mi, const struct filters *filt,
       return 1;
     }
 
+  /* rel_target and display_root MUST both be derived from the fully
+   * resolved absolute path (see resolve_target_path()), never from
+   * argv verbatim - an unresolved "." here would resolve to "current
+   * directory relative to the filesystem root", i.e. the root
+   * directory itself, silently turning a scoped search into a full
+   * on-disk scan (this was a real, shipped bug: 3GB RAM / 100s+ for
+   * what should have been a near-instant lookup of a few files). */
   ext2_ino_t start_ino = EXT2_ROOT_INO;
   if (rel_target[0] != '\0')
     {
@@ -627,13 +704,19 @@ collect_ext_table (const struct mount_info *mi, const struct filters *filt,
   struct ext2_inode start_inode;
   ext2fs_read_inode (fs, start_ino, &start_inode);
 
-  struct table_entry *root_e = table_push (out);
-  fill_entry_from_ext_inode (root_e, fs, start_ino, &start_inode, filt->target);
+  time_t now = time (NULL);
+  int buffer_mode = filt->dump || filt->cache_path || filt->empty_only;
+
+  struct table_entry root_tmp;
+  fill_entry_from_ext_inode (&root_tmp, fs, start_ino, &start_inode, display_root);
+  if (buffer_mode) *table_push (out) = root_tmp;
+  else if (matches_filters (filt, &root_tmp, now)) print_entry (filt, &root_tmp);
 
   if (LINUX_S_ISDIR (start_inode.i_mode) && filt->maxdepth != 0)
     {
-      struct ext_collect_ctx ctx = { .fs = fs, .out = out, .depth = 0, .f = filt };
-      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", filt->target);
+      struct ext_collect_ctx ctx = { .fs = fs, .out = out, .depth = 0, .f = filt,
+                                      .now = now, .buffer_mode = buffer_mode };
+      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", display_root);
       ext2fs_dir_iterate2 (fs, start_ino, 0, NULL, ext_dir_iter_cb, &ctx);
     }
 
@@ -652,6 +735,8 @@ struct ntfs_collect_ctx
   char pathbuf[PATH_MAX];
   long depth;
   const struct filters *f;
+  time_t now;
+  int buffer_mode;
 };
 
 static void
@@ -700,8 +785,12 @@ ntfs_filldir_cb (void *priv, const ntfschar *name, const int name_len,
 
   if (ctx->f->mindepth < 0 || ctx->depth + 1 >= ctx->f->mindepth)
     {
-      struct table_entry *e = table_push (ctx->out);
-      fill_entry_from_ntfs_inode (e, ni, child);
+      struct table_entry tmp;
+      fill_entry_from_ntfs_inode (&tmp, ni, child);
+      if (ctx->buffer_mode)
+        *table_push (ctx->out) = tmp;
+      else if (matches_filters (ctx->f, &tmp, ctx->now))
+        print_entry (ctx->f, &tmp);
     }
 
   int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
@@ -721,7 +810,8 @@ ntfs_filldir_cb (void *priv, const ntfschar *name, const int name_len,
 
 static int
 collect_ntfs_table (const struct mount_info *mi, const struct filters *filt,
-                     const char *rel_target, struct table *out)
+                     const char *rel_target, const char *display_root,
+                     struct table *out)
 {
   ntfs_volume *vol = ntfs_mount (mi->device, NTFS_MNT_RDONLY);
   if (!vol)
@@ -732,6 +822,11 @@ collect_ntfs_table (const struct mount_info *mi, const struct filters *filt,
       return 1;
     }
 
+  /* rel_target must come from the resolved absolute path - see the
+   * comment in collect_ext_table(); the same "." bug applies here:
+   * ntfs_pathname_to_inode(vol, NULL, "/.") still resolves fine, but
+   * an unresolved relative path with ".." components or a bare
+   * relative name would not correctly scope to the caller's cwd. */
   char path_for_lookup[PATH_MAX];
   snprintf (path_for_lookup, sizeof (path_for_lookup), "/%s", rel_target);
 
@@ -744,14 +839,20 @@ collect_ntfs_table (const struct mount_info *mi, const struct filters *filt,
       return 1;
     }
 
-  struct table_entry *root_e = table_push (out);
-  fill_entry_from_ntfs_inode (root_e, start_ni, filt->target);
+  time_t now = time (NULL);
+  int buffer_mode = filt->dump || filt->cache_path || filt->empty_only;
+
+  struct table_entry root_tmp;
+  fill_entry_from_ntfs_inode (&root_tmp, start_ni, display_root);
+  if (buffer_mode) *table_push (out) = root_tmp;
+  else if (matches_filters (filt, &root_tmp, now)) print_entry (filt, &root_tmp);
 
   int is_dir = (start_ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
   if (is_dir && filt->maxdepth != 0)
     {
-      struct ntfs_collect_ctx ctx = { .vol = vol, .out = out, .depth = 0, .f = filt };
-      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", filt->target);
+      struct ntfs_collect_ctx ctx = { .vol = vol, .out = out, .depth = 0, .f = filt,
+                                       .now = now, .buffer_mode = buffer_mode };
+      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", display_root);
       s64 fpos = 0;
       ntfs_readdir (start_ni, &fpos, &ctx, ntfs_filldir_cb);
     }
@@ -957,19 +1058,46 @@ main (int argc, char *argv[])
 build_from_device:
       {
         struct mount_info mi = {0};
-        if (filt.dev)
-          strncpy (mi.device, filt.dev, sizeof (mi.device) - 1);
-        else if (find_backing_mount (filt.target, &mi) != 0)
-          {
-            fprintf (stderr, "dfind: could not find a mounted filesystem "
-                     "backing '%s' in /proc/mounts (use --dev to specify "
-                     "one explicitly)\n", filt.target);
-            return 1;
-          }
+        char resolved_target[PATH_MAX];
+        const char *display_root;
+        const char *rel_target;
 
-        const char *rel_target = filt.dev
-          ? (filt.target[0] == '/' ? filt.target + 1 : filt.target)
-          : relative_to_mount (filt.target, mi.mountpoint);
+        if (filt.dev)
+          {
+            /* Device given explicitly: PATH is already table-relative,
+             * not a live filesystem path, so there is nothing to
+             * resolve against the cwd here. */
+            strncpy (mi.device, filt.dev, sizeof (mi.device) - 1);
+            rel_target = (filt.target[0] == '/' ? filt.target + 1 : filt.target);
+            display_root = filt.target;
+          }
+        else
+          {
+            /* CRITICAL: resolve PATH to a clean absolute form before
+             * doing anything mount- or table-relative with it. Using
+             * argv's raw string here (e.g. ".") previously made
+             * relative_to_mount() compare "." against the mountpoint,
+             * fail to strip anything, and hand ext2fs_namei() a literal
+             * "." - which resolves to the filesystem's ROOT inode, not
+             * the caller's cwd. The practical effect was every -table
+             * search silently scanning the entire device. */
+            if (resolve_target_path (filt.target, resolved_target,
+                                      sizeof (resolved_target)) != 0)
+              {
+                fprintf (stderr, "dfind: could not resolve path '%s'\n",
+                         filt.target);
+                return 1;
+              }
+            if (find_backing_mount (resolved_target, &mi) != 0)
+              {
+                fprintf (stderr, "dfind: could not find a mounted filesystem "
+                         "backing '%s' in /proc/mounts (use --dev to specify "
+                         "one explicitly)\n", filt.target);
+                return 1;
+              }
+            rel_target = relative_to_mount (resolved_target, mi.mountpoint);
+            display_root = resolved_target;
+          }
 
         if (mi.fstype[0] == '\0')
           {
@@ -981,9 +1109,9 @@ build_from_device:
           }
 
         if (!strncmp (mi.fstype, "ext", 3))
-          rc = collect_ext_table (&mi, &filt, rel_target, &table);
+          rc = collect_ext_table (&mi, &filt, rel_target, display_root, &table);
         else if (!strcmp (mi.fstype, "ntfs") || !strcmp (mi.fstype, "fuseblk"))
-          rc = collect_ntfs_table (&mi, &filt, rel_target, &table);
+          rc = collect_ntfs_table (&mi, &filt, rel_target, display_root, &table);
         else
           {
             fprintf (stderr, "dfind: -table has no reader for filesystem "
