@@ -240,6 +240,52 @@ base_name_of (const char *path)
   return slash ? slash + 1 : path;
 }
 
+/* Everything that can be decided from the name/path alone - zero
+ * filesystem I/O, just string matching. Both backends' directory
+ * iterators hand us the entry's name and type for free (ext2's dirent
+ * file_type byte, NTFS's ntfs_filldir dt_type), so this check can run
+ * before we ever open an inode / MFT record. */
+static int
+matches_cheap (const struct filters *f, const char *fullpath)
+{
+  const char *base = base_name_of (fullpath);
+  if (f->name && fnmatch (f->name, base, 0) != 0) return 0;
+  if (f->iname && fnmatch (f->iname, base, FNM_CASEFOLD) != 0) return 0;
+  if (f->path_pat && fnmatch (f->path_pat, fullpath, 0) != 0) return 0;
+  if (f->ipath && fnmatch (f->ipath, fullpath, FNM_CASEFOLD) != 0) return 0;
+  if (f->regex_ready && regexec (&f->regex_compiled, fullpath, 0, NULL, 0) != 0)
+    return 0;
+  return 1;
+}
+
+/* A cheap type char ('f'/'d'/'l'/...) derived from the directory
+ * entry's type byte alone, with no inode/MFT-record read. Returns 0
+ * if the type can't be determined this way (caller must then open the
+ * record to be sure - this is rare: only pre-filetype-feature ext2). */
+static int
+type_char_matches_or_unknown (char requested, char cheap_type)
+{
+  if (!requested) return 1;         /* no -type filter given */
+  if (!cheap_type) return 1;        /* unknown - can't reject cheaply, open it */
+  return requested == cheap_type;
+}
+
+/* Whether this query needs an actual inode/MFT-record read at all, or
+ * can be fully answered from name+path+cheap-type alone. This is the
+ * difference between "stat every file in the tree" (the old, always-
+ * on behavior, and the reason a whole-drive -table search could take
+ * 100x longer than a live find with a warm cache) and "stat only the
+ * files whose name already matched" (what real find effectively gets
+ * for free from the kernel's dentry cache, and what we now do too). */
+static int
+needs_stat (const struct filters *f)
+{
+  return f->mtime.set || f->atime.set || f->ctime.set || f->size_kb.set
+      || f->uid.set || f->gid.set || f->perm_kind != PERM_NONE
+      || f->lname || f->ilname || f->newer_than
+      || f->format != FMT_TEXT; /* ndjson/csv print full metadata */
+}
+
 /* Same day-bucket rule GNU find uses for -mtime/-atime/-ctime: whole
  * days since the reference time, integer division truncating toward
  * zero (matching parser.c's get_relative_timestamp / pred_mtime). */
@@ -253,15 +299,7 @@ static int
 matches_filters (const struct filters *f, const struct table_entry *e,
                   time_t now)
 {
-  const char *base = base_name_of (e->path);
-
-  if (f->name && fnmatch (f->name, base, 0) != 0) return 0;
-  if (f->iname && fnmatch (f->iname, base, FNM_CASEFOLD) != 0) return 0;
-  if (f->path_pat && fnmatch (f->path_pat, e->path, 0) != 0) return 0;
-  if (f->ipath && fnmatch (f->ipath, e->path, FNM_CASEFOLD) != 0) return 0;
-
-  if (f->regex_ready && regexec (&f->regex_compiled, e->path, 0, NULL, 0) != 0)
-    return 0;
+  if (!matches_cheap (f, e->path)) return 0;
 
   if (f->lname || f->ilname)
     {
