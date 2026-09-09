@@ -2,13 +2,17 @@
 
 changelog : 
 
-1.0 : initial release
+1.0 :
+* initial release
 
-1.1 : algorithmic improvements over the standard search method, 20.29% gain in total execution time and 25.45% gain in execution speed
+1.1 :
+* algorithmic improvements over the standard search method, 20.29% gain in total execution time and 25.45% gain in execution speed
 
-1.2 : Optimize traversal by avoiding unnecessary file openings 9.9% gain from 1.1
+1.2 :
+* Optimize traversal by avoiding unnecessary file openings 9.9% gain from 1.1
 
-1.3 : fixed a potential infinite loop in hash table insertion due to insufficient growth of empty slots for metadata logging
+1.3 :
+* fixed a potential infinite loop in hash table insertion due to insufficient growth of empty slots for metadata logging
 
 1.4 : added ext2 filesys support
 * -fixed various errors due to directory traversal logical bug
