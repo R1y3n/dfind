@@ -1100,6 +1100,18 @@ ext_filetype_char (int ft)
     }
 }
 
+/*idk why this keeps breaking :(  */
+static char
+ext_dirent_cheap_type (const struct ext2_dir_entry *dirent)
+{
+  /*
+   * Older e2fsprogs headers have struct ext2_dir_entry without a
+   * separate file_type member. When the filesystem filetype feature is
+   * present, libext2fs packs the type into the high byte of name_len.
+   */
+  return ext_filetype_char ((dirent->name_len >> 8) & 0xff);
+}
+
 static void
 fill_entry_from_ext_inode (struct table_entry *e,
                            ext2_filsys fs,
@@ -1224,7 +1236,8 @@ ext_stream_dir_iter_cb (ext2_ino_t dir_ino,
   if (!out_depth && !rec_depth)
     return 0;
 
-  char cheap_type = ext_filetype_char (dirent->file_type);
+  //char cheap_type = ext_filetype_char (dirent->file_type);
+char cheap_type = ext_dirent_cheap_type (dirent);
   char child[PATH_MAX];
   int have_child = 0;
 
@@ -1592,7 +1605,8 @@ ext_buffer_dir_iter_cb (ext2_ino_t dir_ino,
   if (!out_depth && !rec_depth)
     return 0;
 
-  char cheap_type = ext_filetype_char (dirent->file_type);
+  //char cheap_type = ext_filetype_char (dirent->file_type);
+char cheap_type = ext_dirent_cheap_type (dirent);
   char child[PATH_MAX];
   int have_child = 0;
 
@@ -2499,20 +2513,22 @@ fallback_stream_cb (const char *fpath,
                     int typeflag,
                     struct FTW *ftwbuf)
 {
+long level;
   if (!g_stream_filters || !sb)
     return 0;
 
-  if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
-    return 0;
+ /* if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
+    return 0;*/
+if (typeflag == FTW_NS || typeflag == FTW_DNR) return 0;
 
-  long level = ftwbuf ? ftwbuf->level : 0;
+  	level = ftwbuf ? ftwbuf->level : 0;
 
   if (g_stream_filters->maxdepth >= 0 && level > g_stream_filters->maxdepth)
     return 0;
 
   int ret = 0;
 
-#ifdef FTW_ACTIONRETVAL
+#if defined(FTW_ACTIONRETVAL) && defined(FTW_SKIP_SUBTREE)
   if (typeflag == FTW_D
       && g_stream_filters->maxdepth >= 0
       && level >= g_stream_filters->maxdepth)
@@ -2549,7 +2565,7 @@ collect_live_stream (const struct filters *f)
 
   int flags = FTW_PHYS;
 
-#ifdef FTW_ACTIONRETVAL
+#if defined(FTW_ACTIONRETVAL) && defined(FTW_SKIP_SUBTREE)
   flags |= FTW_ACTIONRETVAL;
 #endif
 
@@ -2569,8 +2585,9 @@ fallback_buffer_cb (const char *fpath,
   if (!g_fallback_table || !sb)
     return 0;
 
-  if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
-    return 0;
+ /* if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
+    return 0;*/
+if (typeflag == FTW_NS || typeflag == FTW_DNR) return 0;
 
   long level = ftwbuf ? ftwbuf->level : 0;
 
@@ -2581,7 +2598,7 @@ fallback_buffer_cb (const char *fpath,
 
   int ret = 0;
 
-#ifdef FTW_ACTIONRETVAL
+#if defined(FTW_ACTIONRETVAL) && defined(FTW_SKIP_SUBTREE)
   if (typeflag == FTW_D
       && g_fallback_filters
       && g_fallback_filters->maxdepth >= 0
@@ -2613,7 +2630,7 @@ collect_live_buffered (const struct filters *f, struct table *out)
 
   int flags = FTW_PHYS;
 
-#ifdef FTW_ACTIONRETVAL
+#if defined(FTW_ACTIONRETVAL) && defined(FTW_SKIP_SUBTREE)
   flags |= FTW_ACTIONRETVAL;
 #endif
 
