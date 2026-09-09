@@ -1,88 +1,14 @@
 /*
- * dfind - "table find"                                     version 0.2
- * ---------------------------------------------------------------------
- * A companion to GNU find, NOT a replacement for it. Invoked as `dfind`,
- * never aliased over `find`.
+ * dfind - table-based file finder
  *
- * WHAT THIS IS
- * ------------
- * Normal `find` walks a directory tree through the live VFS: every
- * directory it visits triggers readdir()/stat() through the kernel,
- * which asks the filesystem driver to translate that into whatever
- * on-disk structure it actually uses.
+ * Optimized fork.
  *
- * dfind's `-table` mode skips that indirection entirely:
- *
- *   1. COLLECT   - resolve which block device backs the target path
- *                  (/proc/mounts, or --dev to point at one directly),
- *                  detect the filesystem, open the raw device with the
- *                  matching metadata-table library, resolve the target
- *                  path to a starting record *inside that table*, and
- *                  walk from there using the table's own directory
- *                  entries - never readdir(). This produces an
- *                  in-memory "table dump": one record per file, with
- *                  path/mode/size/times/uid/gid/symlink-target pulled
- *                  straight from the inode / MFT record.
- *
- *   2. FILTER    - the collected records are filtered in memory using
- *                  the same semantics real find uses (fnmatch for
- *                  -name/-iname/-path/-ipath, POSIX extended regex for
- *                  -regex/-iregex, day-bucketed comparisons for
- *                  -mtime/-atime/-ctime, etc). Because collection and
- *                  filtering are separate steps, you can also skip
- *                  filtering and just get the raw dump (-dump), or
- *                  persist it (--cache FILE) so a second query against
- *                  the same filesystem needs no device I/O at all -
- *                  just re-filter what's already on disk. The dump
- *                  format is plain TSV, one record per line, so
- *                  `-dump | rg pattern` or `-dump | awk ...` works
- *                  directly without going anywhere near dfind's own
- *                  matching code.
- *
- *   3. REPORT    - matches are printed the way find -print would
- *                  (or -print0 / -ls-style / --format ndjson|csv for
- *                  scripting).
- *
- * Filesystem backends:
- *   ext2/ext3/ext4  - libext2fs (the library debugfs/e2fsck use) reads
- *                     the inode table + block group descriptors.
- *   NTFS            - libntfs-3g parses $MFT records directly.
- *   anything else   - no table reader; dfind says so and falls back to
- *                     an ordinary nftw() walk so the tool still works.
- *
- * WHAT'S DELIBERATELY NOT HERE
- * -----------------------------
- * This is a narrow, single-purpose tool, not a find clone. No -exec,
- * no boolean expression parser (all given filters are implicitly
- * AND-ed, same as bare find PATH -a -b -c), no FAT/exFAT/APFS/XFS/Btrfs
- * readers (structurally very different tables - separate backends,
- * left as a TODO below), no encrypted/compressed-file content access.
- *
- * IDEAS FOR THE NEXT PASS (left here for whoever picks this up)
- * ---------------------------------------------------------------
- *   - FAT32/exFAT backend (cluster chain + directory entries are
- *     simple enough to hand-roll without an external lib).
- *   - Btrfs backend via libbtrfs/btrfs-progs' tree-search ioctl, or
- *     offline via btrfs-progs' internal tree-reading code.
- *   - Deleted-entry recovery: ext2 inodes with links_count==0 but
- *     still present in a directory block (unlinked-but-not-reused),
- *     and NTFS MFT records marked not-in-use - both are visible in
- *     the raw table today, we just never look at them. This is the
- *     single most "why did we build a table reader" feature.
- *   - Real boolean expression support (-o / ( ) / -not) instead of
- *     implicit AND, mirroring findutils/find/parser.c's operator
- *     precedence handling.
- *   - Sparse/compressed/resident-vs-nonresident awareness for NTFS
- *     size reporting (currently reports logical data_size only).
- *   - Journal replay before reading (both ext's journal and NTFS's
- *     $LogFile) so -table reflects the very latest writes even if
- *     they haven't been checkpointed yet.
- *
- * Build: see Makefile.dfind (links -lext2fs -lcom_err -lntfs-3g)
- * Requires read access to the raw block device (root, or `disk` group).
+ * Build example:
+ *   gcc -O2 -Wall -o dfind dfind.c -lext2fs -lcom_err -lntfs-3g
  */
 
 #define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,31 +24,123 @@
 #include <time.h>
 #include <pwd.h>
 #include <grp.h>
+#include <dirent.h>
+#include <mntent.h>
 
 #include <ext2fs/ext2fs.h>
+
 #include <ntfs-3g/volume.h>
 #include <ntfs-3g/dir.h>
 #include <ntfs-3g/inode.h>
 #include <ntfs-3g/attrib.h>
 #include <ntfs-3g/ntfstime.h>
+#include <ntfs-3g/unistr.h>
 
-#define DFIND_VERSION "0.2"
+#define DFIND_VERSION "0.3-opt"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifndef EXT2_NAME_LEN
+#define EXT2_NAME_LEN 255
+#endif
 
 /* ================================================================== */
-/* The in-memory "table dump": one record per file/dir/etc, populated */
-/* directly from raw filesystem metadata (never from readdir/stat).   */
+/* Small helpers                                                      */
+/* ================================================================== */
+
+static void
+copy_str (char *dst, size_t dstsz, const char *src)
+{
+  if (!dst || dstsz == 0)
+    return;
+
+  if (!src)
+    {
+      dst[0] = '\0';
+      return;
+    }
+
+  size_t l = strlen (src);
+  if (l >= dstsz)
+    l = dstsz - 1;
+
+  memcpy (dst, src, l);
+  dst[l] = '\0';
+}
+
+static int
+join_path (char *out, size_t outsz, const char *base, const char *name)
+{
+  size_t bl = strlen (base);
+  size_t nl = strlen (name);
+  int need_slash = (bl > 0 && base[bl - 1] != '/') ? 1 : 0;
+
+  if (bl + (size_t) need_slash + nl + 1 > outsz)
+    return -1;
+
+  memcpy (out, base, bl);
+
+  if (need_slash)
+    out[bl] = '/';
+
+  memcpy (out + bl + need_slash, name, nl + 1);
+  return 0;
+}
+
+static int
+ensure_child_path (char *child, size_t childsz,
+                   const char *base, const char *name, int *have_child)
+{
+  if (*have_child)
+    return 0;
+
+  if (join_path (child, childsz, base, name) != 0)
+    return -1;
+
+  *have_child = 1;
+  return 0;
+}
+
+static const char *
+base_name_of (const char *path)
+{
+  const char *end;
+
+  if (!path || !*path)
+    return "";
+
+  end = path + strlen (path);
+
+  while (end > path && end[-1] == '/')
+    end--;
+
+  if (end == path)
+    return "";
+
+  const char *slash = end - 1;
+
+  while (slash >= path && *slash != '/')
+    slash--;
+
+  return slash + 1;
+}
+
+/* ================================================================== */
+/* Table storage                                                      */
 /* ================================================================== */
 
 struct table_entry
 {
-  char path[PATH_MAX];   /* full path, reconstructed while walking   */
-  uint64_t ino;          /* inode number / MFT record number         */
+  char path[PATH_MAX];
+  uint64_t ino;
   mode_t mode;
   off_t size;
   time_t atime, mtime, ctime;
   uid_t uid;
   gid_t gid;
-  char symlink_target[PATH_MAX]; /* empty if not a symlink           */
+  char symlink_target[PATH_MAX];
 };
 
 struct table
@@ -146,26 +164,32 @@ table_push (struct table *t)
     {
       size_t newcap = t->cap ? t->cap * 2 : 256;
       struct table_entry *r = realloc (t->rows, newcap * sizeof (*r));
+
       if (!r)
         {
           fprintf (stderr, "dfind: out of memory growing table\n");
           exit (1);
         }
+
       t->rows = r;
       t->cap = newcap;
     }
+
   struct table_entry *e = &t->rows[t->count++];
   memset (e, 0, sizeof (*e));
   return e;
 }
 
 /* ================================================================== */
-/* Filters - the subset of GNU find's predicate set we support (see   */
-/* findutils/find/parser.c parse_table[] for the reference semantics  */
-/* this mirrors). All given filters are implicitly AND-ed.            */
+/* Filters                                                            */
 /* ================================================================== */
 
-enum num_cmp { CMP_EQ, CMP_GT, CMP_LT };
+enum num_cmp
+{
+  CMP_EQ,
+  CMP_GT,
+  CMP_LT
+};
 
 struct numarg
 {
@@ -174,37 +198,53 @@ struct numarg
   long long val;
 };
 
-/* Parses find-style "N" / "+N" / "-N" numeric args (used by -mtime,
- * -atime, -ctime, -size, -uid, -gid), same convention parser.c's
- * get_num() uses: a leading '+' means "greater than", '-' means
- * "less than", bare digits mean "equal to". */
 static void
 parse_numarg (const char *s, struct numarg *out)
 {
   out->set = 1;
-  if (*s == '+') { out->cmp = CMP_GT; s++; }
-  else if (*s == '-') { out->cmp = CMP_LT; s++; }
-  else out->cmp = CMP_EQ;
+
+  if (*s == '+')
+    {
+      out->cmp = CMP_GT;
+      s++;
+    }
+  else if (*s == '-')
+    {
+      out->cmp = CMP_LT;
+      s++;
+    }
+  else
+    {
+      out->cmp = CMP_EQ;
+    }
+
   out->val = atoll (s);
 }
 
 static int
 numarg_match (const struct numarg *n, long long actual)
 {
-  if (!n->set) return 1;
+  if (!n->set)
+    return 1;
+
   switch (n->cmp)
     {
-    case CMP_GT: return actual > n->val;
-    case CMP_LT: return actual < n->val;
-    default:     return actual == n->val;
+    case CMP_GT:
+      return actual > n->val;
+    case CMP_LT:
+      return actual < n->val;
+    default:
+      return actual == n->val;
     }
 }
 
-/* -perm MODE semantics, mirroring GNU find:
- *   "644"   exact match of permission bits
- *   "-644"  all of these bits must be set (extra bits OK)
- *   "/644"  any of these bits set (0 given means "always true") */
-enum perm_kind { PERM_NONE, PERM_EXACT, PERM_ALL, PERM_ANY };
+enum perm_kind
+{
+  PERM_NONE,
+  PERM_EXACT,
+  PERM_ALL,
+  PERM_ANY
+};
 
 struct filters
 {
@@ -213,193 +253,490 @@ struct filters
   const char *regex_pat, *iregex_pat;
   regex_t regex_compiled;
   int regex_ready;
+
   const char *lname, *ilname;
+
   char type;
   int empty_only;
+
   struct numarg mtime, atime, ctime, size_kb, uid, gid;
+
   enum perm_kind perm_kind;
   mode_t perm_mode;
-  time_t newer_than;         /* from -newer FILE, 0 = unset          */
-  long maxdepth, mindepth;   /* -1 = unset                            */
+
+  time_t newer_than;
+
+  long maxdepth, mindepth;
 
   int use_table;
-  int dump;                  /* -dump: emit raw records, skip most filters */
-  const char *cache_path;    /* --cache FILE                          */
-  int refresh_cache;         /* --refresh: rebuild cache even if present */
-  int print0;                /* -print0                               */
-  enum { FMT_TEXT, FMT_NDJSON, FMT_CSV } format;
+  int dump;
+
+  const char *cache_path;
+  int refresh_cache;
+
+  int print0;
+
+  enum
+  {
+    FMT_TEXT,
+    FMT_NDJSON,
+    FMT_CSV
+  } format;
 
   const char *dev;
   const char *target;
 };
 
-static const char *
-base_name_of (const char *path)
-{
-  const char *slash = strrchr (path, '/');
-  return slash ? slash + 1 : path;
-}
-
-/* Everything that can be decided from the name/path alone - zero
- * filesystem I/O, just string matching. Both backends' directory
- * iterators hand us the entry's name and type for free (ext2's dirent
- * file_type byte, NTFS's ntfs_filldir dt_type), so this check can run
- * before we ever open an inode / MFT record. */
 static int
-matches_cheap (const struct filters *f, const char *fullpath)
+depth_ok_output (const struct filters *f, long depth)
 {
-  const char *base = base_name_of (fullpath);
-  if (f->name && fnmatch (f->name, base, 0) != 0) return 0;
-  if (f->iname && fnmatch (f->iname, base, FNM_CASEFOLD) != 0) return 0;
-  if (f->path_pat && fnmatch (f->path_pat, fullpath, 0) != 0) return 0;
-  if (f->ipath && fnmatch (f->ipath, fullpath, FNM_CASEFOLD) != 0) return 0;
-  if (f->regex_ready && regexec (&f->regex_compiled, fullpath, 0, NULL, 0) != 0)
+  if (f->mindepth >= 0 && depth < f->mindepth)
     return 0;
+
+  if (f->maxdepth >= 0 && depth > f->maxdepth)
+    return 0;
+
   return 1;
 }
 
-/* A cheap type char ('f'/'d'/'l'/...) derived from the directory
- * entry's type byte alone, with no inode/MFT-record read. Returns 0
- * if the type can't be determined this way (caller must then open the
- * record to be sure - this is rare: only pre-filetype-feature ext2). */
 static int
-type_char_matches_or_unknown (char requested, char cheap_type)
+depth_ok_recurse (const struct filters *f, long current_depth)
 {
-  if (!requested) return 1;         /* no -type filter given */
-  if (!cheap_type) return 1;        /* unknown - can't reject cheaply, open it */
-  return requested == cheap_type;
+  if (f->maxdepth < 0)
+    return 1;
+
+  return current_depth < f->maxdepth;
 }
 
-/* Whether this query needs an actual inode/MFT-record read at all, or
- * can be fully answered from name+path+cheap-type alone. This is the
- * difference between "stat every file in the tree" (the old, always-
- * on behavior, and the reason a whole-drive -table search could take
- * 100x longer than a live find with a warm cache) and "stat only the
- * files whose name already matched" (what real find effectively gets
- * for free from the kernel's dentry cache, and what we now do too). */
+static int
+base_matches (const struct filters *f, const char *base)
+{
+  if (f->name && fnmatch (f->name, base, 0) != 0)
+    return 0;
+
+  if (f->iname && fnmatch (f->iname, base, FNM_CASEFOLD) != 0)
+    return 0;
+
+  return 1;
+}
+
+static int
+full_path_filters (const struct filters *f, const char *fullpath)
+{
+  if (f->path_pat && fnmatch (f->path_pat, fullpath, 0) != 0)
+    return 0;
+
+  if (f->ipath && fnmatch (f->ipath, fullpath, FNM_CASEFOLD) != 0)
+    return 0;
+
+  if (f->regex_ready
+      && regexec (&f->regex_compiled, fullpath, 0, NULL, 0) != 0)
+    return 0;
+
+  return 1;
+}
+
+static int
+fast_type_ok (const struct filters *f, char cheap_type)
+{
+  if (!f->type)
+    return 1;
+
+  if (!cheap_type)
+    return 0;
+
+  return f->type == cheap_type;
+}
+
 static int
 needs_stat (const struct filters *f)
 {
-  return f->mtime.set || f->atime.set || f->ctime.set || f->size_kb.set
-      || f->uid.set || f->gid.set || f->perm_kind != PERM_NONE
-      || f->lname || f->ilname || f->newer_than
-      || f->format != FMT_TEXT; /* ndjson/csv print full metadata */
+  return f->mtime.set
+      || f->atime.set
+      || f->ctime.set
+      || f->size_kb.set
+      || f->uid.set
+      || f->gid.set
+      || f->perm_kind != PERM_NONE
+      || f->lname
+      || f->ilname
+      || f->newer_than
+      || f->format != FMT_TEXT;
 }
 
-/* Same day-bucket rule GNU find uses for -mtime/-atime/-ctime: whole
- * days since the reference time, integer division truncating toward
- * zero (matching parser.c's get_relative_timestamp / pred_mtime). */
+static int
+buffer_required (const struct filters *f)
+{
+  return f->dump || f->cache_path || f->empty_only;
+}
+
 static long long
 days_since (time_t reference, time_t t)
 {
   return (long long) difftime (reference, t) / 86400;
 }
 
+static char
+mode_type_char (mode_t m)
+{
+  if (S_ISREG (m))
+    return 'f';
+  if (S_ISDIR (m))
+    return 'd';
+  if (S_ISLNK (m))
+    return 'l';
+  if (S_ISCHR (m))
+    return 'c';
+  if (S_ISBLK (m))
+    return 'b';
+  if (S_ISFIFO (m))
+    return 'p';
+  if (S_ISSOCK (m))
+    return 's';
+
+  return 0;
+}
+
 static int
 matches_filters (const struct filters *f, const struct table_entry *e,
-                  time_t now)
+                 time_t now)
 {
-  if (!matches_cheap (f, e->path)) return 0;
+  const char *base = base_name_of (e->path);
+
+  if (!base_matches (f, base))
+    return 0;
+
+  if (!full_path_filters (f, e->path))
+    return 0;
 
   if (f->lname || f->ilname)
     {
-      if (!S_ISLNK (e->mode)) return 0;
-      if (f->lname && fnmatch (f->lname, e->symlink_target, 0) != 0) return 0;
-      if (f->ilname && fnmatch (f->ilname, e->symlink_target, FNM_CASEFOLD) != 0)
+      if (!S_ISLNK (e->mode))
+        return 0;
+
+      if (f->lname
+          && fnmatch (f->lname, e->symlink_target, 0) != 0)
+        return 0;
+
+      if (f->ilname
+          && fnmatch (f->ilname, e->symlink_target, FNM_CASEFOLD) != 0)
         return 0;
     }
 
   if (f->type)
     {
-      int ok = 0;
-      switch (f->type)
-        {
-        case 'f': ok = S_ISREG (e->mode); break;
-        case 'd': ok = S_ISDIR (e->mode); break;
-        case 'l': ok = S_ISLNK (e->mode); break;
-        case 'c': ok = S_ISCHR (e->mode); break;
-        case 'b': ok = S_ISBLK (e->mode); break;
-        case 'p': ok = S_ISFIFO (e->mode); break;
-        case 's': ok = S_ISSOCK (e->mode); break;
-        default:  ok = 1; break;
-        }
-      if (!ok) return 0;
+      char t = mode_type_char (e->mode);
+
+      if (t && f->type != t)
+        return 0;
     }
 
   if (f->empty_only)
     {
-      if (S_ISREG (e->mode) && e->size != 0) return 0;
-      if (!S_ISREG (e->mode) && !S_ISDIR (e->mode)) return 0;
-      /* Empty-directory detection needs a child count, which the
-       * caller supplies via a negative sentinel size for dirs with
-       * children; see mark_nonempty_dirs(). */
-      if (S_ISDIR (e->mode) && e->size != 0) return 0;
+      if (S_ISREG (e->mode) && e->size != 0)
+        return 0;
+
+      if (!S_ISREG (e->mode) && !S_ISDIR (e->mode))
+        return 0;
+
+      /*
+       * For directories, size is repurposed as a non-empty sentinel:
+       *   0 = empty directory
+       *   1 = has children
+       */
+      if (S_ISDIR (e->mode) && e->size != 0)
+        return 0;
     }
 
-  if (!numarg_match (&f->mtime, days_since (now, e->mtime))) return 0;
-  if (!numarg_match (&f->atime, days_since (now, e->atime))) return 0;
-  if (!numarg_match (&f->ctime, days_since (now, e->ctime))) return 0;
-  if (!numarg_match (&f->uid, e->uid)) return 0;
-  if (!numarg_match (&f->gid, e->gid)) return 0;
-  if (!numarg_match (&f->size_kb, (e->size + 1023) / 1024)) return 0;
+  if (!numarg_match (&f->mtime, days_since (now, e->mtime)))
+    return 0;
 
-  if (f->newer_than && e->mtime <= f->newer_than) return 0;
+  if (!numarg_match (&f->atime, days_since (now, e->atime)))
+    return 0;
+
+  if (!numarg_match (&f->ctime, days_since (now, e->ctime)))
+    return 0;
+
+  if (!numarg_match (&f->uid, e->uid))
+    return 0;
+
+  if (!numarg_match (&f->gid, e->gid))
+    return 0;
+
+  if (!numarg_match (&f->size_kb, (e->size + 1023) / 1024))
+    return 0;
+
+  if (f->newer_than && e->mtime <= f->newer_than)
+    return 0;
 
   if (f->perm_kind != PERM_NONE)
     {
       mode_t bits = e->mode & 07777;
+
       switch (f->perm_kind)
         {
-        case PERM_EXACT: if (bits != f->perm_mode) return 0; break;
-        case PERM_ALL:   if ((bits & f->perm_mode) != f->perm_mode) return 0; break;
-        case PERM_ANY:   if (f->perm_mode && !(bits & f->perm_mode)) return 0; break;
-        default: break;
+        case PERM_EXACT:
+          if (bits != f->perm_mode)
+            return 0;
+          break;
+
+        case PERM_ALL:
+          if ((bits & f->perm_mode) != f->perm_mode)
+            return 0;
+          break;
+
+        case PERM_ANY:
+          if (f->perm_mode && !(bits & f->perm_mode))
+            return 0;
+          break;
+
+        default:
+          break;
         }
     }
 
   return 1;
 }
 
-/* -empty needs to know whether a directory has children; collection
- * stores a running child count in `size` for directories (repurposed
- * field, documented here so nobody "fixes" it later by accident) and
- * this pass finalizes it before filtering runs. */
-static void
-mark_nonempty_dirs (struct table *t)
+/* ================================================================== */
+/* Hash set for O(n) -empty directory detection                       */
+/* ================================================================== */
+
+struct strset
 {
-  for (size_t i = 0; i < t->count; i++)
+  char **keys;
+  size_t cap;
+  size_t used;
+};
+
+static unsigned long
+str_hash (const char *s)
+{
+  unsigned long h = 5381;
+
+  while (*s)
+    h = ((h << 5) + h) ^ (unsigned char) *s++;
+
+  return h;
+}
+
+static void
+strset_init (struct strset *ss, size_t cap)
+{
+  if (cap < 64)
+    cap = 64;
+
+  ss->cap = cap;
+  ss->used = 0;
+  ss->keys = calloc (cap, sizeof (char *));
+
+  if (!ss->keys)
     {
-      if (!S_ISDIR (t->rows[i].mode)) continue;
-      char prefix[PATH_MAX];
-      snprintf (prefix, sizeof (prefix), "%s/", t->rows[i].path);
-      size_t plen = strlen (prefix);
-      int has_child = 0;
-      for (size_t j = 0; j < t->count; j++)
-        {
-          if (j == i) continue;
-          if (strncmp (t->rows[j].path, prefix, plen) == 0
-              && strchr (t->rows[j].path + plen, '/') == NULL)
-            { has_child = 1; break; }
-        }
-      t->rows[i].size = has_child ? 1 : 0;
+      fprintf (stderr, "dfind: out of memory in strset_init\n");
+      exit (1);
     }
 }
 
+static void
+strset_free (struct strset *ss)
+{
+  if (!ss->keys)
+    return;
+
+  for (size_t i = 0; i < ss->cap; i++)
+    free (ss->keys[i]);
+
+  free (ss->keys);
+
+  ss->keys = NULL;
+  ss->cap = 0;
+  ss->used = 0;
+}
+
+static void
+strset_insert_into (char **keys, size_t cap, char *key)
+{
+  size_t h = str_hash (key) % cap;
+
+  while (keys[h])
+    h = (h + 1) % cap;
+
+  keys[h] = key;
+}
+
+static void
+strset_grow (struct strset *ss)
+{
+  size_t newcap = ss->cap * 2;
+  char **newkeys = calloc (newcap, sizeof (char *));
+
+  if (!newkeys)
+    {
+      fprintf (stderr, "dfind: out of memory in strset_grow\n");
+      exit (1);
+    }
+
+  for (size_t i = 0; i < ss->cap; i++)
+    {
+      if (ss->keys[i])
+        strset_insert_into (newkeys, newcap, ss->keys[i]);
+    }
+
+  free (ss->keys);
+
+  ss->keys = newkeys;
+  ss->cap = newcap;
+}
+
+static void
+strset_insert (struct strset *ss, const char *key)
+{
+  if ((ss->used + 1) * 10 >= ss->cap * 7)
+    strset_grow (ss);
+
+  size_t h = str_hash (key) % ss->cap;
+
+  while (ss->keys[h])
+    {
+      if (strcmp (ss->keys[h], key) == 0)
+        return;
+
+      h = (h + 1) % ss->cap;
+    }
+
+  ss->keys[h] = strdup (key);
+
+  if (!ss->keys[h])
+    {
+      fprintf (stderr, "dfind: out of memory in strset_insert\n");
+      exit (1);
+    }
+
+  ss->used++;
+}
+
+static int
+strset_lookup (struct strset *ss, const char *key)
+{
+  if (!ss->cap)
+    return 0;
+
+  size_t h = str_hash (key) % ss->cap;
+
+  while (ss->keys[h])
+    {
+      if (strcmp (ss->keys[h], key) == 0)
+        return 1;
+
+      h = (h + 1) % ss->cap;
+    }
+
+  return 0;
+}
+
+static void
+mark_nonempty_dirs (struct table *t)
+{
+  struct strset ss;
+  char parent[PATH_MAX];
+
+  strset_init (&ss, t->count ? t->count * 2 : 64);
+
+  for (size_t i = 0; i < t->count; i++)
+    {
+      const char *p = t->rows[i].path;
+      const char *slash = strrchr (p, '/');
+
+      if (!slash)
+        continue;
+
+      if (slash == p)
+        {
+          parent[0] = '/';
+          parent[1] = '\0';
+        }
+      else
+        {
+          size_t len = (size_t) (slash - p);
+
+          if (len >= sizeof (parent))
+            len = sizeof (parent) - 1;
+
+          memcpy (parent, p, len);
+          parent[len] = '\0';
+        }
+
+      strset_insert (&ss, parent);
+    }
+
+  for (size_t i = 0; i < t->count; i++)
+    {
+      if (!S_ISDIR (t->rows[i].mode))
+        continue;
+
+      t->rows[i].size = strset_lookup (&ss, t->rows[i].path) ? 1 : 0;
+    }
+
+  strset_free (&ss);
+}
+
 /* ================================================================== */
-/* Output                                                              */
+/* Output                                                             */
 /* ================================================================== */
+
+static void
+print_fast_path (const struct filters *f, const char *path)
+{
+  fputs (path, stdout);
+  putchar (f->print0 ? '\0' : '\n');
+}
 
 static void
 json_escape_print (const char *s)
 {
   putchar ('"');
+
   for (; *s; s++)
     {
-      if (*s == '"' || *s == '\\') putchar ('\\');
-      if ((unsigned char) *s < 0x20) { printf ("\\u%04x", *s); continue; }
+      if (*s == '"' || *s == '\\')
+        putchar ('\\');
+
+      if ((unsigned char) *s < 0x20)
+        {
+          printf ("\\u%04x", (unsigned char) *s);
+          continue;
+        }
+
       putchar (*s);
     }
+
   putchar ('"');
+}
+
+static void
+csv_escape_print (const char *s)
+{
+  if (!s)
+    return;
+
+  if (strpbrk (s, ",\"\n"))
+    {
+      putchar ('"');
+
+      for (; *s; s++)
+        {
+          if (*s == '"')
+            putchar ('"');
+
+          putchar (*s);
+        }
+
+      putchar ('"');
+    }
+  else
+    {
+      fputs (s, stdout);
+    }
 }
 
 static void
@@ -408,25 +745,45 @@ print_entry (const struct filters *f, const struct table_entry *e)
   switch (f->format)
     {
     case FMT_NDJSON:
-      printf ("{\"path\":"); json_escape_print (e->path);
+      printf ("{\"path\":");
+      json_escape_print (e->path);
+
       printf (",\"ino\":%llu,\"mode\":\"%04o\",\"size\":%lld,"
               "\"atime\":%lld,\"mtime\":%lld,\"ctime\":%lld,"
               "\"uid\":%d,\"gid\":%d",
-              (unsigned long long) e->ino, e->mode & 07777,
-              (long long) e->size, (long long) e->atime,
-              (long long) e->mtime, (long long) e->ctime,
-              e->uid, e->gid);
+              (unsigned long long) e->ino,
+              e->mode & 07777,
+              (long long) e->size,
+              (long long) e->atime,
+              (long long) e->mtime,
+              (long long) e->ctime,
+              e->uid,
+              e->gid);
+
       if (e->symlink_target[0])
-        { printf (",\"symlink_target\":"); json_escape_print (e->symlink_target); }
+        {
+          printf (",\"symlink_target\":");
+          json_escape_print (e->symlink_target);
+        }
+
       printf ("}\n");
       break;
+
     case FMT_CSV:
-      printf ("%s,%llu,%04o,%lld,%lld,%lld,%lld,%d,%d,%s\n",
-              e->path, (unsigned long long) e->ino, e->mode & 07777,
-              (long long) e->size, (long long) e->atime,
-              (long long) e->mtime, (long long) e->ctime,
-              e->uid, e->gid, e->symlink_target);
+      csv_escape_print (e->path);
+      printf (",%llu,%04o,%lld,%lld,%lld,%lld,%d,%d,",
+              (unsigned long long) e->ino,
+              e->mode & 07777,
+              (long long) e->size,
+              (long long) e->atime,
+              (long long) e->mtime,
+              (long long) e->ctime,
+              e->uid,
+              e->gid);
+      csv_escape_print (e->symlink_target);
+      putchar ('\n');
       break;
+
     default:
       fputs (e->path, stdout);
       putchar (f->print0 ? '\0' : '\n');
@@ -434,101 +791,154 @@ print_entry (const struct filters *f, const struct table_entry *e)
     }
 }
 
-/* Cache / dump file format: plain TSV, one record per line. Not JSON
- * (no parser dependency, still trivially greppable/awkable). Columns:
- * path \t ino \t mode(octal) \t size \t atime \t mtime \t ctime \t
- * uid \t gid \t symlink_target(may be empty, always last column) */
+/* ================================================================== */
+/* TSV cache / dump                                                   */
+/* ================================================================== */
+
 static int
 write_table_tsv (const struct table *t, FILE *out)
 {
   fprintf (out, "# dfind table dump v1\n");
+
   for (size_t i = 0; i < t->count; i++)
     {
       const struct table_entry *e = &t->rows[i];
-      fprintf (out, "%s\t%llu\t%o\t%lld\t%lld\t%lld\t%lld\t%d\t%d\t%s\n",
-               e->path, (unsigned long long) e->ino, e->mode,
-               (long long) e->size, (long long) e->atime,
-               (long long) e->mtime, (long long) e->ctime,
-               e->uid, e->gid, e->symlink_target);
+
+      fprintf (out, "%s\t%llu\t%llo\t%lld\t%lld\t%lld\t%lld\t%d\t%d\t%s\n",
+               e->path,
+               (unsigned long long) e->ino,
+               (unsigned long long) e->mode,
+               (long long) e->size,
+               (long long) e->atime,
+               (long long) e->mtime,
+               (long long) e->ctime,
+               e->uid,
+               e->gid,
+               e->symlink_target);
     }
+
   return 0;
 }
 
 static int
 read_table_tsv (struct table *t, FILE *in)
 {
-  char line[PATH_MAX * 2];
+  char *line = NULL;
+  size_t cap = 0;
+
   table_init (t);
-  while (fgets (line, sizeof (line), in))
+
+  while (getline (&line, &cap, in) != -1)
     {
-      if (line[0] == '#') continue;
-      struct table_entry tmp = {0};
-      unsigned long long ino; unsigned mode; long long sz, at, mt, ct;
-      int uid, gid;
-      /* path can't contain literal tabs on any fs we read, so a
-       * simple tab split is safe. */
-      char *fields[10]; int nf = 0;
+      if (line[0] == '#' || line[0] == '\n')
+        continue;
+
+      struct table_entry tmp;
+      memset (&tmp, 0, sizeof (tmp));
+
+      char *fields[10];
+      int nf = 0;
       char *save = NULL;
       char *tok = strtok_r (line, "\t", &save);
-      while (tok && nf < 10) { fields[nf++] = tok; tok = strtok_r (NULL, "\t", &save); }
-      if (nf < 9) continue;
-      strncpy (tmp.path, fields[0], sizeof (tmp.path) - 1);
-      ino = strtoull (fields[1], NULL, 10); tmp.ino = ino;
-      mode = strtoul (fields[2], NULL, 8); tmp.mode = mode;
-      sz = strtoll (fields[3], NULL, 10); tmp.size = sz;
-      at = strtoll (fields[4], NULL, 10); tmp.atime = at;
-      mt = strtoll (fields[5], NULL, 10); tmp.mtime = mt;
-      ct = strtoll (fields[6], NULL, 10); tmp.ctime = ct;
-      uid = atoi (fields[7]); tmp.uid = uid;
-      gid = atoi (fields[8]); tmp.gid = gid;
+
+      while (tok && nf < 10)
+        {
+          fields[nf++] = tok;
+          tok = strtok_r (NULL, "\t", &save);
+        }
+
+      if (nf < 9)
+        continue;
+
+      size_t l;
+
+      copy_str (tmp.path, sizeof (tmp.path), fields[0]);
+
+      tmp.ino = strtoull (fields[1], NULL, 10);
+      tmp.mode = (mode_t) strtoul (fields[2], NULL, 8);
+      tmp.size = strtoll (fields[3], NULL, 10);
+      tmp.atime = strtoll (fields[4], NULL, 10);
+      tmp.mtime = strtoll (fields[5], NULL, 10);
+      tmp.ctime = strtoll (fields[6], NULL, 10);
+      tmp.uid = atoi (fields[7]);
+      tmp.gid = atoi (fields[8]);
+
       if (nf >= 10)
         {
-          size_t l = strlen (fields[9]);
-          if (l && fields[9][l - 1] == '\n') fields[9][l - 1] = '\0';
-          strncpy (tmp.symlink_target, fields[9], sizeof (tmp.symlink_target) - 1);
+          l = strlen (fields[9]);
+
+          while (l > 0 && (fields[9][l - 1] == '\n'
+                           || fields[9][l - 1] == '\r'))
+            fields[9][--l] = '\0';
+
+          copy_str (tmp.symlink_target, sizeof (tmp.symlink_target),
+                    fields[9]);
         }
+
       *table_push (t) = tmp;
     }
+
+  free (line);
   return 0;
 }
 
 /* ================================================================== */
-/* /proc/mounts lookup: map a live path -> backing device + fstype    */
+/* Mount lookup                                                       */
 /* ================================================================== */
 
-struct mount_info { char device[PATH_MAX]; char mountpoint[PATH_MAX]; char fstype[64]; };
+struct mount_info
+{
+  char device[PATH_MAX];
+  char mountpoint[PATH_MAX];
+  char fstype[64];
+};
 
 static int
 find_backing_mount (const char *path, struct mount_info *out)
 {
   char resolved[PATH_MAX];
+
   if (!realpath (path, resolved))
-    { strncpy (resolved, path, sizeof (resolved) - 1); resolved[sizeof (resolved) - 1] = 0; }
+    copy_str (resolved, sizeof (resolved), path);
 
-  FILE *fp = fopen ("/proc/mounts", "r");
-  if (!fp) return -1;
+  FILE *fp = setmntent ("/proc/mounts", "r");
+  if (!fp)
+    return -1;
 
-  char line[1024]; size_t best_len = 0; int found = 0;
-  while (fgets (line, sizeof (line), fp))
+  struct mntent *me;
+  size_t best_len = 0;
+  int found = 0;
+
+  while ((me = getmntent (fp)) != NULL)
     {
-      char dev[PATH_MAX], mnt[PATH_MAX], type[64];
-      if (sscanf (line, "%s %s %s", dev, mnt, type) != 3) continue;
-      size_t mlen = strlen (mnt);
-      if (strncmp (resolved, mnt, mlen) == 0
-          && (resolved[mlen] == '\0' || resolved[mlen] == '/' || strcmp (mnt, "/") == 0)
-          && mlen >= best_len)
+      if (!me->mnt_fsname || !me->mnt_dir || !me->mnt_type)
+        continue;
+
+      size_t mlen = strlen (me->mnt_dir);
+      if (mlen == 0)
+        continue;
+
+      int prefix_ok = 0;
+
+      if (mlen == 1 && me->mnt_dir[0] == '/')
+        prefix_ok = 1;
+      else if (strncmp (resolved, me->mnt_dir, mlen) == 0
+               && (resolved[mlen] == '\0' || resolved[mlen] == '/'))
+        prefix_ok = 1;
+
+      if (prefix_ok && mlen >= best_len)
         {
           best_len = mlen;
-          strncpy (out->device, dev, sizeof (out->device) - 1);
-          strncpy (out->mountpoint, mnt, sizeof (out->mountpoint) - 1);
-          strncpy (out->fstype, type, sizeof (out->fstype) - 1);
-          out->device[sizeof (out->device) - 1] = 0;
-          out->mountpoint[sizeof (out->mountpoint) - 1] = 0;
-          out->fstype[sizeof (out->fstype) - 1] = 0;
+
+          copy_str (out->device, sizeof (out->device), me->mnt_fsname);
+          copy_str (out->mountpoint, sizeof (out->mountpoint), me->mnt_dir);
+          copy_str (out->fstype, sizeof (out->fstype), me->mnt_type);
+
           found = 1;
         }
     }
-  fclose (fp);
+
+  endmntent (fp);
   return found ? 0 : -1;
 }
 
@@ -536,226 +946,585 @@ static const char *
 relative_to_mount (const char *fullpath, const char *mountpoint)
 {
   size_t mlen = strlen (mountpoint);
-  if (strncmp (fullpath, mountpoint, mlen) != 0) return fullpath;
+
+  if (mlen == 0)
+    return fullpath;
+
+  if (mlen == 1 && mountpoint[0] == '/')
+    {
+      const char *rel = fullpath + 1;
+
+      while (*rel == '/')
+        rel++;
+
+      return rel;
+    }
+
+  if (strncmp (fullpath, mountpoint, mlen) != 0)
+    return fullpath;
+
+  if (fullpath[mlen] != '\0' && fullpath[mlen] != '/')
+    return fullpath;
+
   const char *rel = fullpath + mlen;
-  while (*rel == '/') rel++;
+
+  while (*rel == '/')
+    rel++;
+
   return rel;
 }
 
-/* Resolves argv's PATH to a clean absolute path, the same way real
- * find/realpath(1) would - but WITHOUT requiring the path to exist on
- * the live tree, since -table's whole point is finding things that
- * might only exist in the on-disk table (or that live under a path
- * you haven't mounted the "normal" way). This absolute form is what
- * -table mode uses for every device/mountpoint/table lookup; the
- * previous version used the raw, possibly-relative argv string (e.g.
- * ".") for that, which made "." resolve to the filesystem's ROOT
- * directory instead of the caller's cwd - silently turning every
- * `-table` search into a full-device scan. See the note at call site.
- */
 static int
 resolve_target_path (const char *arg, char *out, size_t outsz)
 {
+  if (!arg || !*arg)
+    arg = ".";
+
   if (realpath (arg, out))
     return 0;
 
-  /* Path doesn't exist on the live tree right now - normalize it
-   * lexically against the cwd instead of giving up. */
   char cwd[PATH_MAX];
+
   if (!getcwd (cwd, sizeof (cwd)))
     return -1;
 
   char combined[PATH_MAX * 2];
+
   if (arg[0] == '/')
     snprintf (combined, sizeof (combined), "%s", arg);
   else
     snprintf (combined, sizeof (combined), "%s/%s", cwd, arg);
 
-  /* Collapse "." and ".." components component-by-component, same
-   * idea as realpath(3) but without touching the filesystem. */
+  char *buf = strdup (combined);
+  if (!buf)
+    return -1;
+
   char *parts[PATH_MAX / 2];
   int nparts = 0;
   char *save = NULL;
-  char *buf = strdup (combined);
-  for (char *tok = strtok_r (buf, "/", &save); tok; tok = strtok_r (NULL, "/", &save))
+
+  for (char *tok = strtok_r (buf, "/", &save);
+       tok;
+       tok = strtok_r (NULL, "/", &save))
     {
-      if (!strcmp (tok, ".")) continue;
-      if (!strcmp (tok, ".."))
-        { if (nparts > 0) nparts--; continue; }
-      parts[nparts++] = tok;
+      if (strcmp (tok, ".") == 0)
+        continue;
+
+      if (strcmp (tok, "..") == 0)
+        {
+          if (nparts > 0)
+            nparts--;
+
+          continue;
+        }
+
+      if (nparts < (int) (sizeof (parts) / sizeof (parts[0])))
+        parts[nparts++] = tok;
+    }
+
+  if (outsz < 2)
+    {
+      free (buf);
+      return -1;
     }
 
   size_t pos = 0;
   out[pos++] = '/';
   out[pos] = '\0';
+
   for (int i = 0; i < nparts; i++)
     {
       size_t len = strlen (parts[i]);
-      if (pos + len + 2 > outsz) break;
-      if (pos > 1) out[pos++] = '/';
+
+      if (pos + len + 2 > outsz)
+        break;
+
+      if (pos > 1)
+        out[pos++] = '/';
+
       memcpy (out + pos, parts[i], len);
       pos += len;
       out[pos] = '\0';
     }
+
   free (buf);
   return 0;
 }
 
+static void
+detect_magic (const char *device, char *fstype, size_t fstypesz)
+{
+  FILE *f = fopen (device, "rb");
+  if (!f)
+    return;
+
+  unsigned char buf[2048];
+  size_t got = fread (buf, 1, sizeof (buf), f);
+  fclose (f);
+
+  if (got >= 0x43a && buf[0x438] == 0x53 && buf[0x439] == 0xef)
+    copy_str (fstype, fstypesz, "ext4");
+  else if (got >= 11 && memcmp (buf + 3, "NTFS    ", 8) == 0)
+    copy_str (fstype, fstypesz, "ntfs");
+}
+
 /* ================================================================== */
-/* ext2/ext3/ext4 table collection (libext2fs)                        */
+/* ext2/3/4 helpers                                                   */
 /* ================================================================== */
 
-struct ext_collect_ctx
+static char
+ext_filetype_char (int ft)
 {
-  ext2_filsys fs;
-  struct table *out;       /* only written to when buffer_mode is set */
-  char pathbuf[PATH_MAX];
-  long depth;
-  const struct filters *f;
-  time_t now;
-  int buffer_mode;         /* -dump / --cache / -empty need every row
-                             * buffered; a plain filtered search does
-                             * not, and streams matches immediately
-                             * instead so memory stays flat regardless
-                             * of how large the scanned subtree is. */
-};
+  /*
+   * ext2 directory entry file types:
+   * 1 reg, 2 dir, 3 chr, 4 blk, 5 fifo, 6 sock, 7 symlink
+   */
+  switch (ft & 0xff)
+    {
+    case 1:
+      return 'f';
+    case 2:
+      return 'd';
+    case 3:
+      return 'c';
+    case 4:
+      return 'b';
+    case 5:
+      return 'p';
+    case 6:
+      return 's';
+    case 7:
+      return 'l';
+    default:
+      return 0;
+    }
+}
 
 static void
-fill_entry_from_ext_inode (struct table_entry *e, ext2_filsys fs,
-                            ext2_ino_t ino, const struct ext2_inode *inode,
-                            const char *path)
+fill_entry_from_ext_inode (struct table_entry *e,
+                           ext2_filsys fs,
+                           ext2_ino_t ino,
+                           const struct ext2_inode *inode,
+                           const char *path,
+                           int want_symlink)
 {
-  strncpy (e->path, path, sizeof (e->path) - 1);
+  memset (e, 0, sizeof (*e));
+
+  copy_str (e->path, sizeof (e->path), path);
+
   e->ino = ino;
   e->mode = inode->i_mode;
-  e->size = EXT2_I_SIZE (inode);
+  e->size = EXT2_I_SIZE ((struct ext2_inode *) inode);
   e->atime = inode->i_atime;
   e->mtime = inode->i_mtime;
   e->ctime = inode->i_ctime;
-  e->uid = inode->i_uid | (inode->osd2.linux2.l_i_uid_high << 16);
-  e->gid = inode->i_gid | (inode->osd2.linux2.l_i_gid_high << 16);
+
+  e->uid = inode->i_uid
+         | ((uid_t) inode->osd2.linux2.l_i_uid_high << 16);
+
+  e->gid = inode->i_gid
+         | ((gid_t) inode->osd2.linux2.l_i_gid_high << 16);
+
   e->symlink_target[0] = '\0';
 
-  if (LINUX_S_ISLNK (inode->i_mode))
+  if (want_symlink && S_ISLNK (inode->i_mode))
     {
       if (ext2fs_is_fast_symlink ((struct ext2_inode *) inode))
         {
           size_t len = e->size < (off_t) sizeof (e->symlink_target) - 1
-                         ? (size_t) e->size : sizeof (e->symlink_target) - 1;
+                       ? (size_t) e->size
+                       : sizeof (e->symlink_target) - 1;
+
           memcpy (e->symlink_target, (const char *) inode->i_block, len);
           e->symlink_target[len] = '\0';
         }
       else
         {
           ext2_file_t file;
+
           if (ext2fs_file_open (fs, ino, 0, &file) == 0)
             {
+              char tmp[PATH_MAX];
               unsigned int got = 0;
-              ext2fs_file_read (file, e->symlink_target,
-                                 sizeof (e->symlink_target) - 1, &got);
+
+              ext2fs_file_read (file, tmp, sizeof (tmp) - 1, &got);
+
+              if (got >= sizeof (tmp))
+                got = sizeof (tmp) - 1;
+
+              memcpy (e->symlink_target, tmp, got);
               e->symlink_target[got] = '\0';
+
               ext2fs_file_close (file);
             }
         }
     }
 }
 
-static int
-ext_dir_iter_cb (ext2_ino_t dir_ino, int entry, struct ext2_dir_entry *dirent,
-                  int offset, int blocksize, char *buf, void *priv)
+/* ================================================================== */
+/* ext streaming collector                                            */
+/* ================================================================== */
+
+struct ext_stream_ctx
 {
-  (void) dir_ino; (void) entry; (void) offset; (void) blocksize; (void) buf;
-  struct ext_collect_ctx *ctx = priv;
+  ext2_filsys fs;
+  char pathbuf[PATH_MAX];
+  long depth;
+  const struct filters *f;
+  time_t now;
+  int need_meta;
+  int want_symlink;
+};
+
+static void ext_stream_scan_dir (ext2_filsys fs,
+                                 ext2_ino_t dir_ino,
+                                 const char *path,
+                                 long depth,
+                                 const struct filters *f,
+                                 time_t now,
+                                 int need_meta,
+                                 int want_symlink);
+
+static int
+ext_stream_dir_iter_cb (ext2_ino_t dir_ino,
+                        int entry,
+                        struct ext2_dir_entry *dirent,
+                        int offset,
+                        int blocksize,
+                        char *buf,
+                        void *priv)
+{
+  (void) dir_ino;
+  (void) entry;
+  (void) offset;
+  (void) blocksize;
+  (void) buf;
+
+  struct ext_stream_ctx *ctx = priv;
+
+  if (dirent->inode == 0)
+    return 0;
+
   int name_len = dirent->name_len & 0xff;
-  if (dirent->inode == 0) return 0;
+
+  if (name_len <= 0 || name_len > EXT2_NAME_LEN)
+    return 0;
 
   char name[EXT2_NAME_LEN + 1];
   memcpy (name, dirent->name, name_len);
   name[name_len] = '\0';
-  if (strcmp (name, ".") == 0 || strcmp (name, "..") == 0) return 0;
 
-  size_t base_len = strlen (ctx->pathbuf);
+  if (strcmp (name, ".") == 0 || strcmp (name, "..") == 0)
+    return 0;
+
+  long child_depth = ctx->depth + 1;
+  int out_depth = depth_ok_output (ctx->f, child_depth);
+  int rec_depth = depth_ok_recurse (ctx->f, child_depth);
+
+  if (!out_depth && !rec_depth)
+    return 0;
+
+  char cheap_type = ext_filetype_char (dirent->file_type);
   char child[PATH_MAX];
-  snprintf (child, sizeof (child), "%s%s%s", ctx->pathbuf,
-            (base_len && ctx->pathbuf[base_len - 1] != '/') ? "/" : "", name);
+  int have_child = 0;
+
+  /* Known directory. */
+  if (cheap_type == 'd')
+    {
+      int candidate = out_depth
+                   && fast_type_ok (ctx->f, 'd')
+                   && base_matches (ctx->f, name);
+
+      if (candidate)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, name, &have_child) != 0)
+            return 0;
+
+          if (!full_path_filters (ctx->f, child))
+            candidate = 0;
+        }
+
+      if (candidate && !ctx->need_meta)
+        print_fast_path (ctx->f, child);
+
+      if (candidate && ctx->need_meta)
+        {
+          struct ext2_inode inode;
+
+          if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) == 0)
+            {
+              struct table_entry e;
+
+              fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                         &inode, child,
+                                         ctx->want_symlink);
+
+              if (matches_filters (ctx->f, &e, ctx->now))
+                print_entry (ctx->f, &e);
+            }
+        }
+
+      if (rec_depth)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, name, &have_child) == 0)
+            {
+              ext_stream_scan_dir (ctx->fs, dirent->inode, child,
+                                   child_depth, ctx->f, ctx->now,
+                                   ctx->need_meta, ctx->want_symlink);
+            }
+        }
+
+      return 0;
+    }
+
+  /* Known non-directory. */
+  if (cheap_type != 0)
+    {
+      if (!out_depth)
+        return 0;
+
+      if (!fast_type_ok (ctx->f, cheap_type))
+        return 0;
+
+      if (!base_matches (ctx->f, name))
+        return 0;
+
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, name, &have_child) != 0)
+        return 0;
+
+      if (!full_path_filters (ctx->f, child))
+        return 0;
+
+      if (!ctx->need_meta)
+        {
+          print_fast_path (ctx->f, child);
+          return 0;
+        }
+
+      struct ext2_inode inode;
+
+      if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) == 0)
+        {
+          struct table_entry e;
+
+          fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                     &inode, child,
+                                     ctx->want_symlink);
+
+          if (matches_filters (ctx->f, &e, ctx->now))
+            print_entry (ctx->f, &e);
+        }
+
+      return 0;
+    }
+
+  /* Unknown type: read inode only when needed. */
+  int maybe_output = out_depth && base_matches (ctx->f, name);
+
+  if (!rec_depth && !maybe_output)
+    return 0;
 
   struct ext2_inode inode;
-  if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) != 0) return 0;
 
-  if (ctx->f->mindepth < 0 || ctx->depth + 1 >= ctx->f->mindepth)
+  if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) != 0)
+    return 0;
+
+  char t = mode_type_char (inode.i_mode);
+
+  if (t == 'd')
     {
-      struct table_entry tmp;
-      fill_entry_from_ext_inode (&tmp, ctx->fs, dirent->inode, &inode, child);
-      if (ctx->buffer_mode)
-        *table_push (ctx->out) = tmp;
-      else if (matches_filters (ctx->f, &tmp, ctx->now))
-        print_entry (ctx->f, &tmp);
+      int candidate = maybe_output
+                   && out_depth
+                   && fast_type_ok (ctx->f, t);
+
+      if (candidate)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, name, &have_child) != 0)
+            return 0;
+
+          if (!full_path_filters (ctx->f, child))
+            candidate = 0;
+        }
+
+      if (candidate)
+        {
+          if (ctx->need_meta)
+            {
+              struct table_entry e;
+
+              fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                         &inode, child,
+                                         ctx->want_symlink);
+
+              if (matches_filters (ctx->f, &e, ctx->now))
+                print_entry (ctx->f, &e);
+            }
+          else
+            {
+              print_fast_path (ctx->f, child);
+            }
+        }
+
+      if (rec_depth)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, name, &have_child) == 0)
+            {
+              ext_stream_scan_dir (ctx->fs, dirent->inode, child,
+                                   child_depth, ctx->f, ctx->now,
+                                   ctx->need_meta, ctx->want_symlink);
+            }
+        }
+    }
+  else
+    {
+      int candidate = maybe_output
+                   && out_depth
+                   && fast_type_ok (ctx->f, t);
+
+      if (!candidate)
+        return 0;
+
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, name, &have_child) != 0)
+        return 0;
+
+      if (!full_path_filters (ctx->f, child))
+        return 0;
+
+      if (ctx->need_meta)
+        {
+          struct table_entry e;
+
+          fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                     &inode, child,
+                                     ctx->want_symlink);
+
+          if (matches_filters (ctx->f, &e, ctx->now))
+            print_entry (ctx->f, &e);
+        }
+      else
+        {
+          print_fast_path (ctx->f, child);
+        }
     }
 
-  if (LINUX_S_ISDIR (inode.i_mode)
-      && (ctx->f->maxdepth < 0 || ctx->depth + 1 < ctx->f->maxdepth))
-    {
-      struct ext_collect_ctx sub = *ctx;
-      sub.depth = ctx->depth + 1;
-      strncpy (sub.pathbuf, child, sizeof (sub.pathbuf) - 1);
-      sub.pathbuf[sizeof (sub.pathbuf) - 1] = '\0';
-      ext2fs_dir_iterate2 (ctx->fs, dirent->inode, 0, NULL, ext_dir_iter_cb, &sub);
-    }
   return 0;
 }
 
+static void
+ext_stream_scan_dir (ext2_filsys fs,
+                     ext2_ino_t dir_ino,
+                     const char *path,
+                     long depth,
+                     const struct filters *f,
+                     time_t now,
+                     int need_meta,
+                     int want_symlink)
+{
+  struct ext_stream_ctx ctx;
+
+  memset (&ctx, 0, sizeof (ctx));
+
+  ctx.fs = fs;
+  ctx.depth = depth;
+  ctx.f = f;
+  ctx.now = now;
+  ctx.need_meta = need_meta;
+  ctx.want_symlink = want_symlink;
+
+  copy_str (ctx.pathbuf, sizeof (ctx.pathbuf), path);
+
+  ext2fs_dir_iterate2 (fs, dir_ino, 0, NULL,
+                       ext_stream_dir_iter_cb, &ctx);
+}
+
 static int
-collect_ext_table (const struct mount_info *mi, const struct filters *filt,
-                    const char *rel_target, const char *display_root,
-                    struct table *out)
+collect_ext_stream (const struct mount_info *mi,
+                    const struct filters *f,
+                    const char *rel_target,
+                    const char *display_root)
 {
   ext2_filsys fs;
-  errcode_t rc = ext2fs_open (mi->device, 0, 0, 0, unix_io_manager, &fs);
+  errcode_t rc;
+
+  rc = ext2fs_open (mi->device, 0, 0, 0, unix_io_manager, &fs);
+
   if (rc)
     {
       fprintf (stderr,
-        "dfind: ext2fs_open(%s) failed (rc=%ld): is dfind running with "
-        "permission to read the raw device?\n", mi->device, (long) rc);
+               "dfind: ext2fs_open(%s) failed (rc=%ld): check permissions\n",
+               mi->device, (long) rc);
       return 1;
     }
 
-  /* rel_target and display_root MUST both be derived from the fully
-   * resolved absolute path (see resolve_target_path()), never from
-   * argv verbatim - an unresolved "." here would resolve to "current
-   * directory relative to the filesystem root", i.e. the root
-   * directory itself, silently turning a scoped search into a full
-   * on-disk scan (this was a real, shipped bug: 3GB RAM / 100s+ for
-   * what should have been a near-instant lookup of a few files). */
   ext2_ino_t start_ino = EXT2_ROOT_INO;
-  if (rel_target[0] != '\0')
+
+  if (rel_target && rel_target[0] != '\0')
     {
-      rc = ext2fs_namei (fs, EXT2_ROOT_INO, EXT2_ROOT_INO, rel_target, &start_ino);
+      rc = ext2fs_namei (fs, EXT2_ROOT_INO, EXT2_ROOT_INO,
+                         rel_target, &start_ino);
+
       if (rc)
         {
-          fprintf (stderr, "dfind: path '%s' not found in the on-disk "
-                   "inode table of %s\n", rel_target, mi->device);
+          fprintf (stderr,
+                   "dfind: path '%s' not found in ext metadata on %s\n",
+                   rel_target, mi->device);
           ext2fs_close (fs);
           return 1;
         }
     }
 
   struct ext2_inode start_inode;
-  ext2fs_read_inode (fs, start_ino, &start_inode);
+
+  if (ext2fs_read_inode (fs, start_ino, &start_inode) != 0)
+    {
+      fprintf (stderr, "dfind: cannot read starting inode on %s\n",
+               mi->device);
+      ext2fs_close (fs);
+      return 1;
+    }
 
   time_t now = time (NULL);
-  int buffer_mode = filt->dump || filt->cache_path || filt->empty_only;
+  int need_meta = needs_stat (f);
+  int want_symlink = need_meta
+                  && (f->lname || f->ilname || f->format != FMT_TEXT);
 
-  struct table_entry root_tmp;
-  fill_entry_from_ext_inode (&root_tmp, fs, start_ino, &start_inode, display_root);
-  if (buffer_mode) *table_push (out) = root_tmp;
-  else if (matches_filters (filt, &root_tmp, now)) print_entry (filt, &root_tmp);
-
-  if (LINUX_S_ISDIR (start_inode.i_mode) && filt->maxdepth != 0)
+  if (depth_ok_output (f, 0))
     {
-      struct ext_collect_ctx ctx = { .fs = fs, .out = out, .depth = 0, .f = filt,
-                                      .now = now, .buffer_mode = buffer_mode };
-      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", display_root);
-      ext2fs_dir_iterate2 (fs, start_ino, 0, NULL, ext_dir_iter_cb, &ctx);
+      char root_type = mode_type_char (start_inode.i_mode);
+      const char *root_base = base_name_of (display_root);
+
+      if (fast_type_ok (f, root_type)
+          && base_matches (f, root_base)
+          && full_path_filters (f, display_root))
+        {
+          if (need_meta)
+            {
+              struct table_entry e;
+
+              fill_entry_from_ext_inode (&e, fs, start_ino,
+                                         &start_inode, display_root,
+                                         want_symlink);
+
+              if (matches_filters (f, &e, now))
+                print_entry (f, &e);
+            }
+          else
+            {
+              print_fast_path (f, display_root);
+            }
+        }
+    }
+
+  if (S_ISDIR (start_inode.i_mode) && depth_ok_recurse (f, 0))
+    {
+      ext_stream_scan_dir (fs, start_ino, display_root, 0,
+                           f, now, need_meta, want_symlink);
     }
 
   ext2fs_close (fs);
@@ -763,136 +1532,753 @@ collect_ext_table (const struct mount_info *mi, const struct filters *filt,
 }
 
 /* ================================================================== */
-/* NTFS $MFT table collection (libntfs-3g)                            */
+/* ext buffered collector for dump/cache/-empty                       */
 /* ================================================================== */
 
-struct ntfs_collect_ctx
+struct ext_buffer_ctx
 {
-  ntfs_volume *vol;
+  ext2_filsys fs;
   struct table *out;
   char pathbuf[PATH_MAX];
   long depth;
   const struct filters *f;
-  time_t now;
-  int buffer_mode;
+  int want_symlink;
 };
 
-static void
-fill_entry_from_ntfs_inode (struct table_entry *e, ntfs_inode *ni,
-                            const char *path)
-{
-  strncpy (e->path, path, sizeof (e->path) - 1);
-  e->ino = ni->mft_no;
-  int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
-  int is_reparse = (ni->flags & FILE_ATTR_REPARSE_POINT) != 0;
-  e->mode = is_reparse ? (S_IFLNK | 0777)
-            : is_dir   ? (S_IFDIR | 0755)
-                       : (S_IFREG | 0644);
-  e->size = ni->data_size;
-  struct timespec ts;
-  ts = ntfs2timespec (ni->last_access_time);      e->atime = ts.tv_sec;
-  ts = ntfs2timespec (ni->last_data_change_time); e->mtime = ts.tv_sec;
-  ts = ntfs2timespec (ni->last_mft_change_time);  e->ctime = ts.tv_sec;
-  e->uid = 0; e->gid = 0; /* NTFS ACLs don't map to POSIX uid/gid without
-                             an ID-mapping table dfind doesn't build */
-  e->symlink_target[0] = '\0'; /* reparse target parsing: TODO, see header */
-}
+static void ext_buffer_scan_dir (ext2_filsys fs,
+                                 ext2_ino_t dir_ino,
+                                 struct table *out,
+                                 const char *path,
+                                 long depth,
+                                 const struct filters *f,
+                                 int want_symlink);
 
 static int
-ntfs_filldir_cb (void *priv, const ntfschar *name, const int name_len,
-                  const int name_type, const s64 pos, const MFT_REF mref,
-                  const unsigned dt_type)
+ext_buffer_dir_iter_cb (ext2_ino_t dir_ino,
+                        int entry,
+                        struct ext2_dir_entry *dirent,
+                        int offset,
+                        int blocksize,
+                        char *buf,
+                        void *priv)
 {
-  (void) pos; (void) dt_type;
-  struct ntfs_collect_ctx *ctx = priv;
-  if (name_type == FILE_NAME_DOS) return 0;
+  (void) dir_ino;
+  (void) entry;
+  (void) offset;
+  (void) blocksize;
+  (void) buf;
 
-  char *mbname = NULL;
-  if (ntfs_ucstombs (name, name_len, &mbname, 0) < 0 || !mbname) return 0;
-  if (strcmp (mbname, ".") == 0 || strcmp (mbname, "..") == 0)
-    { free (mbname); return 0; }
+  struct ext_buffer_ctx *ctx = priv;
 
-  size_t base_len = strlen (ctx->pathbuf);
+  if (dirent->inode == 0)
+    return 0;
+
+  int name_len = dirent->name_len & 0xff;
+
+  if (name_len <= 0 || name_len > EXT2_NAME_LEN)
+    return 0;
+
+  char name[EXT2_NAME_LEN + 1];
+  memcpy (name, dirent->name, name_len);
+  name[name_len] = '\0';
+
+  if (strcmp (name, ".") == 0 || strcmp (name, "..") == 0)
+    return 0;
+
+  long child_depth = ctx->depth + 1;
+  int out_depth = depth_ok_output (ctx->f, child_depth);
+  int rec_depth = depth_ok_recurse (ctx->f, child_depth);
+
+  if (!out_depth && !rec_depth)
+    return 0;
+
+  char cheap_type = ext_filetype_char (dirent->file_type);
   char child[PATH_MAX];
-  snprintf (child, sizeof (child), "%s%s%s", ctx->pathbuf,
-            (base_len && ctx->pathbuf[base_len - 1] != '/') ? "/" : "", mbname);
-  free (mbname);
+  int have_child = 0;
 
-  ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
-  if (!ni) return 0;
-
-  if (ctx->f->mindepth < 0 || ctx->depth + 1 >= ctx->f->mindepth)
+  if (cheap_type == 'd')
     {
-      struct table_entry tmp;
-      fill_entry_from_ntfs_inode (&tmp, ni, child);
-      if (ctx->buffer_mode)
-        *table_push (ctx->out) = tmp;
-      else if (matches_filters (ctx->f, &tmp, ctx->now))
-        print_entry (ctx->f, &tmp);
+      if (out_depth)
+        {
+          struct ext2_inode inode;
+
+          if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) == 0)
+            {
+              if (ensure_child_path (child, sizeof (child),
+                                     ctx->pathbuf, name,
+                                     &have_child) == 0)
+                {
+                  struct table_entry e;
+
+                  fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                             &inode, child,
+                                             ctx->want_symlink);
+
+                  *table_push (ctx->out) = e;
+                }
+            }
+        }
+
+      if (rec_depth)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, name, &have_child) == 0)
+            {
+              ext_buffer_scan_dir (ctx->fs, dirent->inode, ctx->out,
+                                   child, child_depth, ctx->f,
+                                   ctx->want_symlink);
+            }
+        }
+
+      return 0;
     }
 
-  int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
-  if (is_dir && (ctx->f->maxdepth < 0 || ctx->depth + 1 < ctx->f->maxdepth))
+  if (cheap_type != 0)
     {
-      struct ntfs_collect_ctx sub = *ctx;
-      sub.depth = ctx->depth + 1;
-      strncpy (sub.pathbuf, child, sizeof (sub.pathbuf) - 1);
-      sub.pathbuf[sizeof (sub.pathbuf) - 1] = '\0';
-      s64 fpos = 0;
-      ntfs_readdir (ni, &fpos, &sub, ntfs_filldir_cb);
+      if (!out_depth)
+        return 0;
+
+      struct ext2_inode inode;
+
+      if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) != 0)
+        return 0;
+
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, name, &have_child) != 0)
+        return 0;
+
+      struct table_entry e;
+
+      fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                 &inode, child, ctx->want_symlink);
+
+      *table_push (ctx->out) = e;
+      return 0;
     }
 
-  ntfs_inode_close (ni);
+  struct ext2_inode inode;
+
+  if (ext2fs_read_inode (ctx->fs, dirent->inode, &inode) != 0)
+    return 0;
+
+  char t = mode_type_char (inode.i_mode);
+
+  if (out_depth)
+    {
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, name, &have_child) == 0)
+        {
+          struct table_entry e;
+
+          fill_entry_from_ext_inode (&e, ctx->fs, dirent->inode,
+                                     &inode, child, ctx->want_symlink);
+
+          *table_push (ctx->out) = e;
+        }
+    }
+
+  if (t == 'd' && rec_depth)
+    {
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, name, &have_child) == 0)
+        {
+          ext_buffer_scan_dir (ctx->fs, dirent->inode, ctx->out,
+                               child, child_depth, ctx->f,
+                               ctx->want_symlink);
+        }
+    }
+
   return 0;
 }
 
+static void
+ext_buffer_scan_dir (ext2_filsys fs,
+                     ext2_ino_t dir_ino,
+                     struct table *out,
+                     const char *path,
+                     long depth,
+                     const struct filters *f,
+                     int want_symlink)
+{
+  struct ext_buffer_ctx ctx;
+
+  memset (&ctx, 0, sizeof (ctx));
+
+  ctx.fs = fs;
+  ctx.out = out;
+  ctx.depth = depth;
+  ctx.f = f;
+  ctx.want_symlink = want_symlink;
+
+  copy_str (ctx.pathbuf, sizeof (ctx.pathbuf), path);
+
+  ext2fs_dir_iterate2 (fs, dir_ino, 0, NULL,
+                       ext_buffer_dir_iter_cb, &ctx);
+}
+
 static int
-collect_ntfs_table (const struct mount_info *mi, const struct filters *filt,
-                     const char *rel_target, const char *display_root,
-                     struct table *out)
+collect_ext_table_buffered (const struct mount_info *mi,
+                            const struct filters *f,
+                            const char *rel_target,
+                            const char *display_root,
+                            struct table *out)
+{
+  ext2_filsys fs;
+  errcode_t rc;
+
+  rc = ext2fs_open (mi->device, 0, 0, 0, unix_io_manager, &fs);
+
+  if (rc)
+    {
+      fprintf (stderr,
+               "dfind: ext2fs_open(%s) failed (rc=%ld): check permissions\n",
+               mi->device, (long) rc);
+      return 1;
+    }
+
+  ext2_ino_t start_ino = EXT2_ROOT_INO;
+
+  if (rel_target && rel_target[0] != '\0')
+    {
+      rc = ext2fs_namei (fs, EXT2_ROOT_INO, EXT2_ROOT_INO,
+                         rel_target, &start_ino);
+
+      if (rc)
+        {
+          fprintf (stderr,
+                   "dfind: path '%s' not found in ext metadata on %s\n",
+                   rel_target, mi->device);
+          ext2fs_close (fs);
+          return 1;
+        }
+    }
+
+  struct ext2_inode start_inode;
+
+  if (ext2fs_read_inode (fs, start_ino, &start_inode) != 0)
+    {
+      fprintf (stderr, "dfind: cannot read starting inode on %s\n",
+               mi->device);
+      ext2fs_close (fs);
+      return 1;
+    }
+
+  int want_symlink = f->dump
+                  || f->cache_path
+                  || f->lname
+                  || f->ilname
+                  || f->format != FMT_TEXT;
+
+  if (depth_ok_output (f, 0))
+    {
+      struct table_entry root;
+
+      fill_entry_from_ext_inode (&root, fs, start_ino,
+                                 &start_inode, display_root,
+                                 want_symlink);
+
+      *table_push (out) = root;
+    }
+
+  if (S_ISDIR (start_inode.i_mode) && depth_ok_recurse (f, 0))
+    {
+      ext_buffer_scan_dir (fs, start_ino, out, display_root, 0,
+                           f, want_symlink);
+    }
+
+  ext2fs_close (fs);
+  return 0;
+}
+
+/* ================================================================== */
+/* NTFS helpers                                                       */
+/* ================================================================== */
+
+static char
+ntfs_dt_type_char (unsigned dt_type)
+{
+  switch (dt_type)
+    {
+#ifdef DT_DIR
+    case DT_DIR:
+      return 'd';
+#endif
+#ifdef DT_REG
+    case DT_REG:
+      return 'f';
+#endif
+#ifdef DT_LNK
+    case DT_LNK:
+      return 'l';
+#endif
+#ifdef DT_CHR
+    case DT_CHR:
+      return 'c';
+#endif
+#ifdef DT_BLK
+    case DT_BLK:
+      return 'b';
+#endif
+#ifdef DT_FIFO
+    case DT_FIFO:
+      return 'p';
+#endif
+#ifdef DT_SOCK
+    case DT_SOCK:
+      return 's';
+#endif
+    default:
+      return 0;
+    }
+}
+
+static char
+ntfs_inode_type_char (ntfs_inode *ni)
+{
+  if (ni->flags & FILE_ATTR_REPARSE_POINT)
+    return 'l';
+
+  if (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)
+    return 'd';
+
+  return 'f';
+}
+
+static void
+fill_entry_from_ntfs_inode (struct table_entry *e,
+                            ntfs_inode *ni,
+                            const char *path)
+{
+  memset (e, 0, sizeof (*e));
+
+  copy_str (e->path, sizeof (e->path), path);
+
+  e->ino = ni->mft_no;
+
+  int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
+  int is_reparse = (ni->flags & FILE_ATTR_REPARSE_POINT) != 0;
+
+  e->mode = is_reparse ? (S_IFLNK | 0777)
+          : is_dir     ? (S_IFDIR | 0755)
+                       : (S_IFREG | 0644);
+
+  e->size = ni->data_size;
+
+  struct timespec ts;
+
+  ts = ntfs2timespec (ni->last_access_time);
+  e->atime = ts.tv_sec;
+
+  ts = ntfs2timespec (ni->last_data_change_time);
+  e->mtime = ts.tv_sec;
+
+  ts = ntfs2timespec (ni->last_mft_change_time);
+  e->ctime = ts.tv_sec;
+
+  e->uid = 0;
+  e->gid = 0;
+
+  e->symlink_target[0] = '\0';
+}
+
+/* ================================================================== */
+/* NTFS streaming collector                                           */
+/* ================================================================== */
+
+struct ntfs_stream_ctx
+{
+  ntfs_volume *vol;
+  char pathbuf[PATH_MAX];
+  long depth;
+  const struct filters *f;
+  time_t now;
+  int need_meta;
+};
+
+static void ntfs_stream_scan_dir (ntfs_volume *vol,
+                                  ntfs_inode *dir_ni,
+                                  const char *path,
+                                  long depth,
+                                  const struct filters *f,
+                                  time_t now,
+                                  int need_meta);
+
+static int
+ntfs_stream_filldir_cb (void *priv,
+                        const ntfschar *name,
+                        const int name_len,
+                        const int name_type,
+                        const s64 pos,
+                        const MFT_REF mref,
+                        const unsigned dt_type)
+{
+  (void) pos;
+
+  struct ntfs_stream_ctx *ctx = priv;
+
+  /* Skip pure DOS names. */
+  if (name_type == 2)
+    return 0;
+
+  char *mbname = NULL;
+
+  if (ntfs_ucstombs (name, name_len, &mbname, 0) < 0 || !mbname)
+    return 0;
+
+  if (strcmp (mbname, ".") == 0 || strcmp (mbname, "..") == 0)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  long child_depth = ctx->depth + 1;
+  int out_depth = depth_ok_output (ctx->f, child_depth);
+  int rec_depth = depth_ok_recurse (ctx->f, child_depth);
+
+  if (!out_depth && !rec_depth)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  char cheap_type = ntfs_dt_type_char (dt_type);
+
+  /*
+   * If caller wants symlinks, do not trust a plain-file dirent type
+   * blindly; NTFS reparse points may need an inode lookup.
+   */
+  if (ctx->f->type == 'l' && cheap_type == 'f')
+    cheap_type = 0;
+
+  char child[PATH_MAX];
+  int have_child = 0;
+
+  /* Known directory. */
+  if (cheap_type == 'd')
+    {
+      int candidate = out_depth
+                   && fast_type_ok (ctx->f, 'd')
+                   && base_matches (ctx->f, mbname);
+
+      if (candidate)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, mbname,
+                                 &have_child) != 0)
+            {
+              free (mbname);
+              return 0;
+            }
+
+          if (!full_path_filters (ctx->f, child))
+            candidate = 0;
+        }
+
+      if (candidate && !ctx->need_meta)
+        print_fast_path (ctx->f, child);
+
+      if (rec_depth || (candidate && ctx->need_meta))
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, mbname,
+                                 &have_child) == 0)
+            {
+              ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
+
+              if (ni)
+                {
+                  if (candidate && ctx->need_meta)
+                    {
+                      struct table_entry e;
+
+                      fill_entry_from_ntfs_inode (&e, ni, child);
+
+                      if (matches_filters (ctx->f, &e, ctx->now))
+                        print_entry (ctx->f, &e);
+                    }
+
+                  if (rec_depth)
+                    {
+                      ntfs_stream_scan_dir (ctx->vol, ni, child,
+                                            child_depth, ctx->f,
+                                            ctx->now, ctx->need_meta);
+                    }
+
+                  ntfs_inode_close (ni);
+                }
+            }
+        }
+
+      free (mbname);
+      return 0;
+    }
+
+  /* Known non-directory. */
+  if (cheap_type != 0)
+    {
+      if (!out_depth)
+        {
+          free (mbname);
+          return 0;
+        }
+
+      if (!fast_type_ok (ctx->f, cheap_type))
+        {
+          free (mbname);
+          return 0;
+        }
+
+      if (!base_matches (ctx->f, mbname))
+        {
+          free (mbname);
+          return 0;
+        }
+
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, mbname, &have_child) != 0)
+        {
+          free (mbname);
+          return 0;
+        }
+
+      if (!full_path_filters (ctx->f, child))
+        {
+          free (mbname);
+          return 0;
+        }
+
+      if (!ctx->need_meta)
+        {
+          print_fast_path (ctx->f, child);
+          free (mbname);
+          return 0;
+        }
+
+      ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
+
+      if (ni)
+        {
+          struct table_entry e;
+
+          fill_entry_from_ntfs_inode (&e, ni, child);
+
+          if (matches_filters (ctx->f, &e, ctx->now))
+            print_entry (ctx->f, &e);
+
+          ntfs_inode_close (ni);
+        }
+
+      free (mbname);
+      return 0;
+    }
+
+  /* Unknown type. */
+  int maybe_output = out_depth && base_matches (ctx->f, mbname);
+
+  if (!rec_depth && !maybe_output)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  /*
+   * If we are at max depth, need no metadata, have no type filter,
+   * and the name matches, print without opening the MFT record.
+   */
+  if (!rec_depth && maybe_output && !ctx->need_meta && !ctx->f->type)
+    {
+      if (ensure_child_path (child, sizeof (child),
+                             ctx->pathbuf, mbname, &have_child) == 0)
+        {
+          if (full_path_filters (ctx->f, child))
+            print_fast_path (ctx->f, child);
+        }
+
+      free (mbname);
+      return 0;
+    }
+
+  ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
+
+  if (!ni)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  char t = ntfs_inode_type_char (ni);
+
+  if (t == 'd')
+    {
+      int candidate = maybe_output
+                   && out_depth
+                   && fast_type_ok (ctx->f, t);
+
+      if (candidate)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, mbname,
+                                 &have_child) != 0)
+            candidate = 0;
+          else if (!full_path_filters (ctx->f, child))
+            candidate = 0;
+        }
+
+      if (candidate && !ctx->need_meta)
+        print_fast_path (ctx->f, child);
+
+      if (candidate && ctx->need_meta)
+        {
+          struct table_entry e;
+
+          fill_entry_from_ntfs_inode (&e, ni, child);
+
+          if (matches_filters (ctx->f, &e, ctx->now))
+            print_entry (ctx->f, &e);
+        }
+
+      if (rec_depth)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, mbname,
+                                 &have_child) == 0)
+            {
+              ntfs_stream_scan_dir (ctx->vol, ni, child,
+                                    child_depth, ctx->f,
+                                    ctx->now, ctx->need_meta);
+            }
+        }
+    }
+  else
+    {
+      int candidate = maybe_output
+                   && out_depth
+                   && fast_type_ok (ctx->f, t);
+
+      if (candidate)
+        {
+          if (ensure_child_path (child, sizeof (child),
+                                 ctx->pathbuf, mbname,
+                                 &have_child) != 0)
+            candidate = 0;
+          else if (!full_path_filters (ctx->f, child))
+            candidate = 0;
+        }
+
+      if (candidate)
+        {
+          if (!ctx->need_meta)
+            {
+              print_fast_path (ctx->f, child);
+            }
+          else
+            {
+              struct table_entry e;
+
+              fill_entry_from_ntfs_inode (&e, ni, child);
+
+              if (matches_filters (ctx->f, &e, ctx->now))
+                print_entry (ctx->f, &e);
+            }
+        }
+    }
+
+  ntfs_inode_close (ni);
+  free (mbname);
+  return 0;
+}
+
+static void
+ntfs_stream_scan_dir (ntfs_volume *vol,
+                      ntfs_inode *dir_ni,
+                      const char *path,
+                      long depth,
+                      const struct filters *f,
+                      time_t now,
+                      int need_meta)
+{
+  struct ntfs_stream_ctx ctx;
+
+  memset (&ctx, 0, sizeof (ctx));
+
+  ctx.vol = vol;
+  ctx.depth = depth;
+  ctx.f = f;
+  ctx.now = now;
+  ctx.need_meta = need_meta;
+
+  copy_str (ctx.pathbuf, sizeof (ctx.pathbuf), path);
+
+  s64 fpos = 0;
+  ntfs_readdir (dir_ni, &fpos, &ctx, ntfs_stream_filldir_cb);
+}
+
+static int
+collect_ntfs_stream (const struct mount_info *mi,
+                     const struct filters *f,
+                     const char *rel_target,
+                     const char *display_root)
 {
   ntfs_volume *vol = ntfs_mount (mi->device, NTFS_MNT_RDONLY);
+
   if (!vol)
     {
-      fprintf (stderr, "dfind: ntfs_mount(%s) failed: is dfind running "
-               "with permission to read the raw device? (%s)\n",
+      fprintf (stderr,
+               "dfind: ntfs_mount(%s) failed: check permissions (%s)\n",
                mi->device, strerror (errno));
       return 1;
     }
 
-  /* rel_target must come from the resolved absolute path - see the
-   * comment in collect_ext_table(); the same "." bug applies here:
-   * ntfs_pathname_to_inode(vol, NULL, "/.") still resolves fine, but
-   * an unresolved relative path with ".." components or a bare
-   * relative name would not correctly scope to the caller's cwd. */
   char path_for_lookup[PATH_MAX];
-  snprintf (path_for_lookup, sizeof (path_for_lookup), "/%s", rel_target);
 
-  ntfs_inode *start_ni = ntfs_pathname_to_inode (vol, NULL, path_for_lookup);
+  path_for_lookup[0] = '/';
+  copy_str (path_for_lookup + 1, sizeof (path_for_lookup) - 1,
+            rel_target ? rel_target : "");
+
+  ntfs_inode *start_ni = ntfs_pathname_to_inode (vol, NULL,
+                                                 path_for_lookup);
+
   if (!start_ni)
     {
-      fprintf (stderr, "dfind: path '%s' not found in the $MFT of %s\n",
-               rel_target, mi->device);
+      fprintf (stderr,
+               "dfind: path '%s' not found in NTFS $MFT of %s\n",
+               rel_target ? rel_target : "/", mi->device);
       ntfs_umount (vol, FALSE);
       return 1;
     }
 
   time_t now = time (NULL);
-  int buffer_mode = filt->dump || filt->cache_path || filt->empty_only;
+  int need_meta = needs_stat (f);
+  char root_type = ntfs_inode_type_char (start_ni);
 
-  struct table_entry root_tmp;
-  fill_entry_from_ntfs_inode (&root_tmp, start_ni, display_root);
-  if (buffer_mode) *table_push (out) = root_tmp;
-  else if (matches_filters (filt, &root_tmp, now)) print_entry (filt, &root_tmp);
-
-  int is_dir = (start_ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
-  if (is_dir && filt->maxdepth != 0)
+  if (depth_ok_output (f, 0))
     {
-      struct ntfs_collect_ctx ctx = { .vol = vol, .out = out, .depth = 0, .f = filt,
-                                       .now = now, .buffer_mode = buffer_mode };
-      snprintf (ctx.pathbuf, sizeof (ctx.pathbuf), "%s", display_root);
-      s64 fpos = 0;
-      ntfs_readdir (start_ni, &fpos, &ctx, ntfs_filldir_cb);
+      const char *root_base = base_name_of (display_root);
+
+      if (fast_type_ok (f, root_type)
+          && base_matches (f, root_base)
+          && full_path_filters (f, display_root))
+        {
+          if (need_meta)
+            {
+              struct table_entry e;
+
+              fill_entry_from_ntfs_inode (&e, start_ni, display_root);
+
+              if (matches_filters (f, &e, now))
+                print_entry (f, &e);
+            }
+          else
+            {
+              print_fast_path (f, display_root);
+            }
+        }
+    }
+
+  if (root_type == 'd' && depth_ok_recurse (f, 0))
+    {
+      ntfs_stream_scan_dir (vol, start_ni, display_root, 0,
+                            f, now, need_meta);
     }
 
   ntfs_inode_close (start_ni);
@@ -901,93 +2287,440 @@ collect_ntfs_table (const struct mount_info *mi, const struct filters *filt,
 }
 
 /* ================================================================== */
-/* Fallback: ordinary live traversal (no -table), same filters        */
+/* NTFS buffered collector                                            */
 /* ================================================================== */
 
-static struct table *g_fallback_table;
+struct ntfs_buffer_ctx
+{
+  ntfs_volume *vol;
+  struct table *out;
+  char pathbuf[PATH_MAX];
+  long depth;
+  const struct filters *f;
+};
+
+static void ntfs_buffer_scan_dir (ntfs_volume *vol,
+                                  ntfs_inode *dir_ni,
+                                  struct table *out,
+                                  const char *path,
+                                  long depth,
+                                  const struct filters *f);
 
 static int
-nftw_cb (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
+ntfs_buffer_filldir_cb (void *priv,
+                        const ntfschar *name,
+                        const int name_len,
+                        const int name_type,
+                        const s64 pos,
+                        const MFT_REF mref,
+                        const unsigned dt_type)
 {
-  (void) typeflag; (void) ftwbuf;
-  struct table_entry *e = table_push (g_fallback_table);
-  strncpy (e->path, fpath, sizeof (e->path) - 1);
-  e->ino = sb->st_ino;
-  e->mode = sb->st_mode;
-  e->size = sb->st_size;
-  e->atime = sb->st_atime; e->mtime = sb->st_mtime; e->ctime = sb->st_ctime;
-  e->uid = sb->st_uid; e->gid = sb->st_gid;
-  e->symlink_target[0] = '\0';
-  if (S_ISLNK (sb->st_mode))
+  (void) pos;
+  (void) dt_type;
+
+  struct ntfs_buffer_ctx *ctx = priv;
+
+  if (name_type == 2)
+    return 0;
+
+  char *mbname = NULL;
+
+  if (ntfs_ucstombs (name, name_len, &mbname, 0) < 0 || !mbname)
+    return 0;
+
+  if (strcmp (mbname, ".") == 0 || strcmp (mbname, "..") == 0)
     {
-      ssize_t n = readlink (fpath, e->symlink_target, sizeof (e->symlink_target) - 1);
-      if (n > 0) e->symlink_target[n] = '\0';
+      free (mbname);
+      return 0;
     }
+
+  long child_depth = ctx->depth + 1;
+  int out_depth = depth_ok_output (ctx->f, child_depth);
+  int rec_depth = depth_ok_recurse (ctx->f, child_depth);
+
+  if (!out_depth && !rec_depth)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  char child[PATH_MAX];
+
+  if (join_path (child, sizeof (child), ctx->pathbuf, mbname) != 0)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
+
+  if (!ni)
+    {
+      free (mbname);
+      return 0;
+    }
+
+  if (out_depth)
+    {
+      struct table_entry e;
+
+      fill_entry_from_ntfs_inode (&e, ni, child);
+      *table_push (ctx->out) = e;
+    }
+
+  int is_dir = (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
+
+  if (is_dir && rec_depth)
+    {
+      ntfs_buffer_scan_dir (ctx->vol, ni, ctx->out, child,
+                            child_depth, ctx->f);
+    }
+
+  ntfs_inode_close (ni);
+  free (mbname);
   return 0;
 }
 
-static int
-collect_live_fallback (const struct filters *filt, struct table *out)
+static void
+ntfs_buffer_scan_dir (ntfs_volume *vol,
+                      ntfs_inode *dir_ni,
+                      struct table *out,
+                      const char *path,
+                      long depth,
+                      const struct filters *f)
 {
-  g_fallback_table = out;
-  return nftw (filt->target, nftw_cb, 16, FTW_PHYS) == 0 ? 0 : 1;
+  struct ntfs_buffer_ctx ctx;
+
+  memset (&ctx, 0, sizeof (ctx));
+
+  ctx.vol = vol;
+  ctx.out = out;
+  ctx.depth = depth;
+  ctx.f = f;
+
+  copy_str (ctx.pathbuf, sizeof (ctx.pathbuf), path);
+
+  s64 fpos = 0;
+  ntfs_readdir (dir_ni, &fpos, &ctx, ntfs_buffer_filldir_cb);
+}
+
+static int
+collect_ntfs_table_buffered (const struct mount_info *mi,
+                             const struct filters *f,
+                             const char *rel_target,
+                             const char *display_root,
+                             struct table *out)
+{
+  ntfs_volume *vol = ntfs_mount (mi->device, NTFS_MNT_RDONLY);
+
+  if (!vol)
+    {
+      fprintf (stderr,
+               "dfind: ntfs_mount(%s) failed: check permissions (%s)\n",
+               mi->device, strerror (errno));
+      return 1;
+    }
+
+  char path_for_lookup[PATH_MAX];
+
+  path_for_lookup[0] = '/';
+  copy_str (path_for_lookup + 1, sizeof (path_for_lookup) - 1,
+            rel_target ? rel_target : "");
+
+  ntfs_inode *start_ni = ntfs_pathname_to_inode (vol, NULL,
+                                                 path_for_lookup);
+
+  if (!start_ni)
+    {
+      fprintf (stderr,
+               "dfind: path '%s' not found in NTFS $MFT of %s\n",
+               rel_target ? rel_target : "/", mi->device);
+      ntfs_umount (vol, FALSE);
+      return 1;
+    }
+
+  if (depth_ok_output (f, 0))
+    {
+      struct table_entry root;
+
+      fill_entry_from_ntfs_inode (&root, start_ni, display_root);
+      *table_push (out) = root;
+    }
+
+  int is_dir = (start_ni->mrec->flags & MFT_RECORD_IS_DIRECTORY) != 0;
+
+  if (is_dir && depth_ok_recurse (f, 0))
+    {
+      ntfs_buffer_scan_dir (vol, start_ni, out, display_root, 0, f);
+    }
+
+  ntfs_inode_close (start_ni);
+  ntfs_umount (vol, FALSE);
+  return 0;
 }
 
 /* ================================================================== */
-/* CLI                                                                 */
+/* Live fallback                                                      */
+/* ================================================================== */
+
+static void
+fill_from_stat (struct table_entry *e, const char *path,
+                const struct stat *sb)
+{
+  memset (e, 0, sizeof (*e));
+
+  copy_str (e->path, sizeof (e->path), path);
+
+  e->ino = sb->st_ino;
+  e->mode = sb->st_mode;
+  e->size = sb->st_size;
+  e->atime = sb->st_atime;
+  e->mtime = sb->st_mtime;
+  e->ctime = sb->st_ctime;
+  e->uid = sb->st_uid;
+  e->gid = sb->st_gid;
+
+  if (S_ISLNK (sb->st_mode))
+    {
+      ssize_t n = readlink (path, e->symlink_target,
+                            sizeof (e->symlink_target) - 1);
+
+      if (n > 0)
+        e->symlink_target[n] = '\0';
+    }
+}
+
+static const struct filters *g_stream_filters;
+static time_t g_stream_now;
+
+static int
+fallback_stream_cb (const char *fpath,
+                    const struct stat *sb,
+                    int typeflag,
+                    struct FTW *ftwbuf)
+{
+  if (!g_stream_filters || !sb)
+    return 0;
+
+  if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
+    return 0;
+
+  long level = ftwbuf ? ftwbuf->level : 0;
+
+  if (g_stream_filters->maxdepth >= 0 && level > g_stream_filters->maxdepth)
+    return 0;
+
+  int ret = 0;
+
+#ifdef FTW_ACTIONRETVAL
+  if (typeflag == FTW_D
+      && g_stream_filters->maxdepth >= 0
+      && level >= g_stream_filters->maxdepth)
+    ret = FTW_SKIP_SUBTREE;
+#endif
+
+  if (depth_ok_output (g_stream_filters, level))
+    {
+      struct table_entry e;
+
+      fill_from_stat (&e, fpath, sb);
+
+      if (matches_filters (g_stream_filters, &e, g_stream_now))
+        print_entry (g_stream_filters, &e);
+    }
+
+  return ret;
+}
+
+static int
+collect_live_stream (const struct filters *f)
+{
+  struct stat sb;
+
+  if (lstat (f->target, &sb) != 0)
+    {
+      fprintf (stderr, "dfind: cannot stat '%s': %s\n",
+               f->target, strerror (errno));
+      return 1;
+    }
+
+  g_stream_filters = f;
+  g_stream_now = time (NULL);
+
+  int flags = FTW_PHYS;
+
+#ifdef FTW_ACTIONRETVAL
+  flags |= FTW_ACTIONRETVAL;
+#endif
+
+  nftw (f->target, fallback_stream_cb, 16, flags);
+  return 0;
+}
+
+static struct table *g_fallback_table;
+static const struct filters *g_fallback_filters;
+
+static int
+fallback_buffer_cb (const char *fpath,
+                    const struct stat *sb,
+                    int typeflag,
+                    struct FTW *ftwbuf)
+{
+  if (!g_fallback_table || !sb)
+    return 0;
+
+  if (typeflag == FTW_NS || typeflag == FTW_DNR || typeflag == FTW_ERR)
+    return 0;
+
+  long level = ftwbuf ? ftwbuf->level : 0;
+
+  if (g_fallback_filters
+      && g_fallback_filters->maxdepth >= 0
+      && level > g_fallback_filters->maxdepth)
+    return 0;
+
+  int ret = 0;
+
+#ifdef FTW_ACTIONRETVAL
+  if (typeflag == FTW_D
+      && g_fallback_filters
+      && g_fallback_filters->maxdepth >= 0
+      && level >= g_fallback_filters->maxdepth)
+    ret = FTW_SKIP_SUBTREE;
+#endif
+
+  struct table_entry *e = table_push (g_fallback_table);
+
+  fill_from_stat (e, fpath, sb);
+
+  return ret;
+}
+
+static int
+collect_live_buffered (const struct filters *f, struct table *out)
+{
+  struct stat sb;
+
+  if (lstat (f->target, &sb) != 0)
+    {
+      fprintf (stderr, "dfind: cannot stat '%s': %s\n",
+               f->target, strerror (errno));
+      return 1;
+    }
+
+  g_fallback_table = out;
+  g_fallback_filters = f;
+
+  int flags = FTW_PHYS;
+
+#ifdef FTW_ACTIONRETVAL
+  flags |= FTW_ACTIONRETVAL;
+#endif
+
+  nftw (f->target, fallback_buffer_cb, 16, flags);
+  return 0;
+}
+
+/* ================================================================== */
+/* Table processing                                                   */
+/* ================================================================== */
+
+static int
+process_table (struct table *t, const struct filters *f)
+{
+  if (f->dump)
+    {
+      if (f->format == FMT_TEXT)
+        write_table_tsv (t, stdout);
+      else
+        {
+          for (size_t i = 0; i < t->count; i++)
+            print_entry (f, &t->rows[i]);
+        }
+
+      return 0;
+    }
+
+  if (f->empty_only)
+    mark_nonempty_dirs (t);
+
+  time_t now = time (NULL);
+
+  for (size_t i = 0; i < t->count; i++)
+    {
+      if (matches_filters (f, &t->rows[i], now))
+        print_entry (f, &t->rows[i]);
+    }
+
+  return 0;
+}
+
+/* ================================================================== */
+/* CLI                                                                */
 /* ================================================================== */
 
 static void
 usage (const char *prog)
 {
   fprintf (stderr,
-"dfind %s - search a filesystem's own metadata table instead of walking it\n\n"
-"Usage: %s PATH [options]\n\n"
+"dfind %s - search filesystem metadata tables directly\n"
+"\n"
+"Usage: %s PATH [options]\n"
+"\n"
 "Table source:\n"
-"  -table            read the on-disk metadata table (ext inode table /\n"
-"                     NTFS $MFT) instead of walking the live tree.\n"
-"  --dev DEVICE      read this block device/image directly, skip\n"
-"                     /proc/mounts lookup (PATH is then table-relative).\n"
-"  --cache FILE      reuse a previous -dump saved to FILE instead of\n"
-"                     touching the device again; created if missing.\n"
-"  --refresh         with --cache, rebuild FILE even if it exists.\n\n"
-"Name/path filters (fnmatch, like real find):\n"
-"  -name PAT  -iname PAT   match the basename (iname = case-insensitive)\n"
-"  -path PAT  -ipath PAT   match the full path\n"
-"  -regex RE  -iregex RE   POSIX extended regex against the full path\n"
-"  -lname PAT -ilname PAT  match a symlink's target text\n\n"
-"Type/attribute filters:\n"
-"  -type f|d|l|c|b|p|s     entry type\n"
-"  -empty                  empty regular files or empty directories\n"
-"  -perm MODE              exact (644), all-bits (-644), any-bits (/644)\n"
-"  -uid N  -gid N          numeric owner (N, +N, -N like find)\n"
-"  -size N                 size in KiB, rounded up (N, +N, -N)\n\n"
-"Time filters (N, +N, -N = whole days from now, like real find):\n"
-"  -mtime N  -atime N  -ctime N\n"
-"  -newer FILE             modified more recently than FILE\n\n"
-"Depth:\n"
-"  -maxdepth N  -mindepth N\n\n"
+"  -table                 read raw metadata table instead of live walk\n"
+"  --dev DEVICE           use this block device/image directly\n"
+"  --cache FILE           reuse or create a table cache file\n"
+"  --refresh              rebuild cache even if it exists\n"
+"\n"
+"Name/path filters:\n"
+"  -name PAT  -iname PAT\n"
+"  -path PAT  -ipath PAT\n"
+"  -regex RE  -iregex RE\n"
+"  -lname PAT -ilname PAT\n"
+"\n"
+"Attribute filters:\n"
+"  -type f|d|l|c|b|p|s\n"
+"  -empty\n"
+"  -perm MODE\n"
+"  -uid N     -gid N\n"
+"  -size N\n"
+"  -mtime N   -atime N   -ctime N\n"
+"  -newer FILE\n"
+"  -maxdepth N -mindepth N\n"
+"\n"
 "Output:\n"
-"  -print0                 NUL-separated instead of newline-separated\n"
-"  --format text|ndjson|csv   default text (one path per line)\n"
-"  -dump                   print every collected record (ignores the\n"
-"                           name/type/time/etc filters above; combine\n"
-"                           with --format ndjson|csv, or pipe the\n"
-"                           default TSV into rg/awk/grep yourself)\n\n"
-"Without -table, PATH is walked live (nftw) with the same filters, so\n"
-"they can be exercised without root or a raw device.\n",
-    DFIND_VERSION, prog);
+"  -print0\n"
+"  --format text|ndjson|csv\n"
+"  -dump\n"
+"\n",
+           DFIND_VERSION, prog);
 }
 
 static int
 parse_perm_arg (const char *s, enum perm_kind *kind, mode_t *mode)
 {
-  if (*s == '-') { *kind = PERM_ALL; s++; }
-  else if (*s == '/') { *kind = PERM_ANY; s++; }
-  else *kind = PERM_EXACT;
+  if (*s == '-')
+    {
+      *kind = PERM_ALL;
+      s++;
+    }
+  else if (*s == '/')
+    {
+      *kind = PERM_ANY;
+      s++;
+    }
+  else
+    {
+      *kind = PERM_EXACT;
+    }
+
   char *end;
   long v = strtol (s, &end, 8);
-  if (*end != '\0') return -1;
+
+  if (*end != '\0')
+    return -1;
+
   *mode = (mode_t) v;
   return 0;
 }
@@ -995,198 +2728,316 @@ parse_perm_arg (const char *s, enum perm_kind *kind, mode_t *mode)
 int
 main (int argc, char *argv[])
 {
-  struct filters filt = {0};
-  filt.maxdepth = -1; filt.mindepth = -1;
+  struct filters filt;
+
+  memset (&filt, 0, sizeof (filt));
+
+  filt.maxdepth = -1;
+  filt.mindepth = -1;
   filt.format = FMT_TEXT;
 
-  if (argc < 2) { usage (argv[0]); return 2; }
-  if (strcmp (argv[1], "--help") == 0 || strcmp (argv[1], "-h") == 0)
-    { usage (argv[0]); return 0; }
-  if (strcmp (argv[1], "--version") == 0)
-    { printf ("dfind %s\n", DFIND_VERSION); return 0; }
-  filt.target = argv[1];
+  if (argc < 2)
+    {
+      usage (argv[0]);
+      return 2;
+    }
 
-  time_t newer_file_mtime = 0;
+  if (strcmp (argv[1], "--help") == 0 || strcmp (argv[1], "-h") == 0)
+    {
+      usage (argv[0]);
+      return 0;
+    }
+
+  if (strcmp (argv[1], "--version") == 0)
+    {
+      printf ("dfind %s\n", DFIND_VERSION);
+      return 0;
+    }
+
+  filt.target = argv[1];
 
   for (int i = 2; i < argc; i++)
     {
       const char *a = argv[i];
-      #define NEXT() (++i < argc ? argv[i] : (fprintf (stderr, "dfind: %s needs an argument\n", a), exit (2), (char*)0))
 
-      if (!strcmp (a, "-table")) filt.use_table = 1;
-      else if (!strcmp (a, "--dev")) filt.dev = NEXT ();
-      else if (!strcmp (a, "--cache")) filt.cache_path = NEXT ();
-      else if (!strcmp (a, "--refresh")) filt.refresh_cache = 1;
-      else if (!strcmp (a, "-name")) filt.name = NEXT ();
-      else if (!strcmp (a, "-iname")) filt.iname = NEXT ();
-      else if (!strcmp (a, "-path")) filt.path_pat = NEXT ();
-      else if (!strcmp (a, "-ipath")) filt.ipath = NEXT ();
-      else if (!strcmp (a, "-regex")) filt.regex_pat = NEXT ();
-      else if (!strcmp (a, "-iregex")) filt.iregex_pat = NEXT ();
-      else if (!strcmp (a, "-lname")) filt.lname = NEXT ();
-      else if (!strcmp (a, "-ilname")) filt.ilname = NEXT ();
-      else if (!strcmp (a, "-type")) filt.type = NEXT ()[0];
-      else if (!strcmp (a, "-empty")) filt.empty_only = 1;
+#define NEXT() (((i + 1) < argc) ? argv[++i] : \
+                (fprintf (stderr, "dfind: %s needs an argument\n", a), \
+                 exit (2), (const char *) NULL))
+
+      if (!strcmp (a, "-table"))
+        filt.use_table = 1;
+      else if (!strcmp (a, "--dev"))
+        filt.dev = NEXT ();
+      else if (!strcmp (a, "--cache"))
+        filt.cache_path = NEXT ();
+      else if (!strcmp (a, "--refresh"))
+        filt.refresh_cache = 1;
+      else if (!strcmp (a, "-name"))
+        filt.name = NEXT ();
+      else if (!strcmp (a, "-iname"))
+        filt.iname = NEXT ();
+      else if (!strcmp (a, "-path"))
+        filt.path_pat = NEXT ();
+      else if (!strcmp (a, "-ipath"))
+        filt.ipath = NEXT ();
+      else if (!strcmp (a, "-regex"))
+        filt.regex_pat = NEXT ();
+      else if (!strcmp (a, "-iregex"))
+        filt.iregex_pat = NEXT ();
+      else if (!strcmp (a, "-lname"))
+        filt.lname = NEXT ();
+      else if (!strcmp (a, "-ilname"))
+        filt.ilname = NEXT ();
+      else if (!strcmp (a, "-type"))
+        filt.type = NEXT ()[0];
+      else if (!strcmp (a, "-empty"))
+        filt.empty_only = 1;
       else if (!strcmp (a, "-perm"))
         {
-          if (parse_perm_arg (NEXT (), &filt.perm_kind, &filt.perm_mode) != 0)
-            { fprintf (stderr, "dfind: bad -perm argument\n"); return 2; }
+          if (parse_perm_arg (NEXT (), &filt.perm_kind,
+                              &filt.perm_mode) != 0)
+            {
+              fprintf (stderr, "dfind: bad -perm argument\n");
+              return 2;
+            }
         }
-      else if (!strcmp (a, "-uid")) parse_numarg (NEXT (), &filt.uid);
-      else if (!strcmp (a, "-gid")) parse_numarg (NEXT (), &filt.gid);
-      else if (!strcmp (a, "-size")) parse_numarg (NEXT (), &filt.size_kb);
-      else if (!strcmp (a, "-mtime")) parse_numarg (NEXT (), &filt.mtime);
-      else if (!strcmp (a, "-atime")) parse_numarg (NEXT (), &filt.atime);
-      else if (!strcmp (a, "-ctime")) parse_numarg (NEXT (), &filt.ctime);
+      else if (!strcmp (a, "-uid"))
+        parse_numarg (NEXT (), &filt.uid);
+      else if (!strcmp (a, "-gid"))
+        parse_numarg (NEXT (), &filt.gid);
+      else if (!strcmp (a, "-size"))
+        parse_numarg (NEXT (), &filt.size_kb);
+      else if (!strcmp (a, "-mtime"))
+        parse_numarg (NEXT (), &filt.mtime);
+      else if (!strcmp (a, "-atime"))
+        parse_numarg (NEXT (), &filt.atime);
+      else if (!strcmp (a, "-ctime"))
+        parse_numarg (NEXT (), &filt.ctime);
       else if (!strcmp (a, "-newer"))
         {
           struct stat sb;
           const char *ref = NEXT ();
+
           if (stat (ref, &sb) != 0)
-            { fprintf (stderr, "dfind: -newer: cannot stat '%s'\n", ref); return 2; }
-          newer_file_mtime = sb.st_mtime;
-          filt.newer_than = newer_file_mtime;
+            {
+              fprintf (stderr, "dfind: -newer: cannot stat '%s'\n", ref);
+              return 2;
+            }
+
+          filt.newer_than = sb.st_mtime;
         }
-      else if (!strcmp (a, "-maxdepth")) filt.maxdepth = atol (NEXT ());
-      else if (!strcmp (a, "-mindepth")) filt.mindepth = atol (NEXT ());
-      else if (!strcmp (a, "-print0")) filt.print0 = 1;
-      else if (!strcmp (a, "-dump")) filt.dump = 1;
+      else if (!strcmp (a, "-maxdepth"))
+        filt.maxdepth = atol (NEXT ());
+      else if (!strcmp (a, "-mindepth"))
+        filt.mindepth = atol (NEXT ());
+      else if (!strcmp (a, "-print0"))
+        filt.print0 = 1;
+      else if (!strcmp (a, "-dump"))
+        filt.dump = 1;
       else if (!strcmp (a, "--format"))
         {
           const char *v = NEXT ();
-          if (!strcmp (v, "text")) filt.format = FMT_TEXT;
-          else if (!strcmp (v, "ndjson")) filt.format = FMT_NDJSON;
-          else if (!strcmp (v, "csv")) filt.format = FMT_CSV;
-          else { fprintf (stderr, "dfind: unknown --format '%s'\n", v); return 2; }
+
+          if (!strcmp (v, "text"))
+            filt.format = FMT_TEXT;
+          else if (!strcmp (v, "ndjson"))
+            filt.format = FMT_NDJSON;
+          else if (!strcmp (v, "csv"))
+            filt.format = FMT_CSV;
+          else
+            {
+              fprintf (stderr, "dfind: unknown --format '%s'\n", v);
+              return 2;
+            }
         }
       else
-        { fprintf (stderr, "dfind: unrecognized argument '%s'\n", a); usage (argv[0]); return 2; }
-      #undef NEXT
+        {
+          fprintf (stderr, "dfind: unrecognized argument '%s'\n", a);
+          usage (argv[0]);
+          return 2;
+        }
+
+#undef NEXT
     }
 
   if (filt.regex_pat || filt.iregex_pat)
     {
       const char *pat = filt.regex_pat ? filt.regex_pat : filt.iregex_pat;
-      int cflags = REG_EXTENDED | REG_NOSUB | (filt.iregex_pat ? REG_ICASE : 0);
+      int cflags = REG_EXTENDED | REG_NOSUB
+                 | (filt.iregex_pat ? REG_ICASE : 0);
+
       if (regcomp (&filt.regex_compiled, pat, cflags) != 0)
-        { fprintf (stderr, "dfind: invalid -regex pattern\n"); return 2; }
+        {
+          fprintf (stderr, "dfind: invalid -regex pattern\n");
+          return 2;
+        }
+
       filt.regex_ready = 1;
     }
 
-  struct table table; table_init (&table);
+  setvbuf (stdout, NULL, _IOFBF, 1 << 20);
+
+  struct table table;
+  table_init (&table);
+
   int rc = 0;
 
+  /* Live fallback mode. */
   if (!filt.use_table)
     {
-      rc = collect_live_fallback (&filt, &table);
+      if (buffer_required (&filt))
+        {
+          rc = collect_live_buffered (&filt, &table);
+
+          if (rc == 0)
+            rc = process_table (&table, &filt);
+        }
+      else
+        {
+          rc = collect_live_stream (&filt);
+        }
+
+      free (table.rows);
+      return rc;
     }
-  else if (filt.cache_path && !filt.refresh_cache)
+
+  /* Use existing cache if possible. */
+  if (filt.cache_path && !filt.refresh_cache)
     {
       FILE *cf = fopen (filt.cache_path, "r");
+
       if (cf)
         {
           read_table_tsv (&table, cf);
           fclose (cf);
+
+          rc = process_table (&table, &filt);
+
+          free (table.rows);
+          return rc;
         }
-      else
-        goto build_from_device;
+    }
+
+  /* Build from device or mounted filesystem. */
+  struct mount_info mi;
+  memset (&mi, 0, sizeof (mi));
+
+  char resolved_target[PATH_MAX];
+  const char *display_root;
+  const char *rel_target;
+
+  if (filt.dev)
+    {
+      copy_str (mi.device, sizeof (mi.device), filt.dev);
+
+      rel_target = filt.target[0] == '/'
+                   ? filt.target + 1
+                   : filt.target;
+
+      display_root = filt.target;
     }
   else
     {
-build_from_device:
-      {
-        struct mount_info mi = {0};
-        char resolved_target[PATH_MAX];
-        const char *display_root;
-        const char *rel_target;
+      if (resolve_target_path (filt.target, resolved_target,
+                               sizeof (resolved_target)) != 0)
+        {
+          fprintf (stderr, "dfind: could not resolve path '%s'\n",
+                   filt.target);
+          return 1;
+        }
 
-        if (filt.dev)
-          {
-            /* Device given explicitly: PATH is already table-relative,
-             * not a live filesystem path, so there is nothing to
-             * resolve against the cwd here. */
-            strncpy (mi.device, filt.dev, sizeof (mi.device) - 1);
-            rel_target = (filt.target[0] == '/' ? filt.target + 1 : filt.target);
-            display_root = filt.target;
-          }
-        else
-          {
-            /* CRITICAL: resolve PATH to a clean absolute form before
-             * doing anything mount- or table-relative with it. Using
-             * argv's raw string here (e.g. ".") previously made
-             * relative_to_mount() compare "." against the mountpoint,
-             * fail to strip anything, and hand ext2fs_namei() a literal
-             * "." - which resolves to the filesystem's ROOT inode, not
-             * the caller's cwd. The practical effect was every -table
-             * search silently scanning the entire device. */
-            if (resolve_target_path (filt.target, resolved_target,
-                                      sizeof (resolved_target)) != 0)
-              {
-                fprintf (stderr, "dfind: could not resolve path '%s'\n",
-                         filt.target);
-                return 1;
-              }
-            if (find_backing_mount (resolved_target, &mi) != 0)
-              {
-                fprintf (stderr, "dfind: could not find a mounted filesystem "
-                         "backing '%s' in /proc/mounts (use --dev to specify "
-                         "one explicitly)\n", filt.target);
-                return 1;
-              }
-            rel_target = relative_to_mount (resolved_target, mi.mountpoint);
-            display_root = resolved_target;
-          }
+      if (find_backing_mount (resolved_target, &mi) != 0)
+        {
+          fprintf (stderr,
+                   "dfind: could not find mounted filesystem backing '%s' "
+                   "(use --dev to specify one explicitly)\n",
+                   filt.target);
+          return 1;
+        }
 
-        if (mi.fstype[0] == '\0')
-          {
-            FILE *f = fopen (mi.device, "rb");
-            unsigned char buf[2048] = {0};
-            if (f) { if (fread (buf, 1, sizeof (buf), f) < 0) {}; fclose (f); }
-            if (buf[0x438] == 0x53 && buf[0x439] == 0xef) strcpy (mi.fstype, "ext4");
-            else if (memcmp (buf + 3, "NTFS    ", 8) == 0) strcpy (mi.fstype, "ntfs");
-          }
-
-        if (!strncmp (mi.fstype, "ext", 3))
-          rc = collect_ext_table (&mi, &filt, rel_target, display_root, &table);
-        else if (!strcmp (mi.fstype, "ntfs") || !strcmp (mi.fstype, "fuseblk"))
-          rc = collect_ntfs_table (&mi, &filt, rel_target, display_root, &table);
-        else
-          {
-            fprintf (stderr, "dfind: -table has no reader for filesystem "
-                     "type '%s' (only ext2/3/4 and NTFS are supported); "
-                     "falling back to a live walk instead.\n", mi.fstype);
-            rc = collect_live_fallback (&filt, &table);
-          }
-
-        if (rc == 0 && filt.cache_path)
-          {
-            FILE *cf = fopen (filt.cache_path, "w");
-            if (cf) { write_table_tsv (&table, cf); fclose (cf); }
-            else fprintf (stderr, "dfind: warning: could not write cache "
-                          "file '%s': %s\n", filt.cache_path, strerror (errno));
-          }
-      }
+      rel_target = relative_to_mount (resolved_target, mi.mountpoint);
+      display_root = resolved_target;
     }
 
-  if (rc != 0) { free (table.rows); return rc; }
+  if (mi.fstype[0] == '\0')
+    detect_magic (mi.device, mi.fstype, sizeof (mi.fstype));
 
-  if (filt.dump)
+  int is_ext = strncmp (mi.fstype, "ext", 3) == 0;
+  int is_ntfs = strcmp (mi.fstype, "ntfs") == 0
+             || strcmp (mi.fstype, "fuseblk") == 0;
+
+  if (!is_ext && !is_ntfs)
     {
-      if (filt.format == FMT_TEXT)
-        write_table_tsv (&table, stdout);
+      if (filt.dev)
+        {
+          fprintf (stderr,
+                   "dfind: cannot detect supported filesystem on %s "
+                   "(only ext2/3/4 and NTFS are supported)\n",
+                   filt.dev);
+          return 1;
+        }
+
+      fprintf (stderr,
+               "dfind: no table reader for filesystem type '%s'; "
+               "falling back to live walk\n",
+               mi.fstype);
+
+      if (buffer_required (&filt))
+        {
+          rc = collect_live_buffered (&filt, &table);
+
+          if (rc == 0)
+            rc = process_table (&table, &filt);
+        }
       else
-        for (size_t i = 0; i < table.count; i++) print_entry (&filt, &table.rows[i]);
+        {
+          rc = collect_live_stream (&filt);
+        }
+
       free (table.rows);
-      return 0;
+      return rc;
     }
 
-  if (filt.empty_only) mark_nonempty_dirs (&table);
+  /* Fast streaming table mode. */
+  if (!buffer_required (&filt))
+    {
+      if (is_ext)
+        rc = collect_ext_stream (&mi, &filt, rel_target, display_root);
+      else
+        rc = collect_ntfs_stream (&mi, &filt, rel_target, display_root);
 
-  time_t now = time (NULL);
-  for (size_t i = 0; i < table.count; i++)
-    if (matches_filters (&filt, &table.rows[i], now))
-      print_entry (&filt, &table.rows[i]);
+      free (table.rows);
+      return rc;
+    }
+
+  /* Buffered table mode for dump/cache/-empty. */
+  if (is_ext)
+    rc = collect_ext_table_buffered (&mi, &filt, rel_target,
+                                     display_root, &table);
+  else
+    rc = collect_ntfs_table_buffered (&mi, &filt, rel_target,
+                                      display_root, &table);
+
+  if (rc == 0 && filt.cache_path)
+    {
+      FILE *cf = fopen (filt.cache_path, "w");
+
+      if (cf)
+        {
+          write_table_tsv (&table, cf);
+          fclose (cf);
+        }
+      else
+        {
+          fprintf (stderr,
+                   "dfind: warning: could not write cache file '%s': %s\n",
+                   filt.cache_path, strerror (errno));
+        }
+    }
+
+  if (rc == 0)
+    rc = process_table (&table, &filt);
 
   free (table.rows);
-  return 0;
+  return rc;
 }

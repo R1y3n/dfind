@@ -6,6 +6,14 @@ changelog :
 
 1.1 : algorithmic improvements over the standard search method, 20.29% gain in total execution time and 25.45% gain in execution speed
 
+1.2 : Optimize traversal by avoiding unnecessary file openings 9.9% gain from 1.1
+
+1.3 : fixed a potential infinite loop in hash table insertion due to insufficient growth of empty slots for metadata logging
+
+1.4 : added ext2 filesys support
+      fixed various errors due to directory traversal logical bug
+      added a buffer collector cache parser in memory for potentially corrupt inodes
+
 `dfind` is a standalone file-finding tool that can enumerate files directly from filesystem metadata tables instead of relying on the normal VFS directory walk.
 
 It currently supports **ext2/ext3/ext4** and **NTFS**.
