@@ -18,6 +18,10 @@ changelog :
 * -fixed various errors due to directory traversal logical bug
 * -added a buffer collector cache parser in memory for potentially corrupt inodes
 
+1.5 : 
+* skipping type matching for ext4 inodes
+* improved memory allocation for NTFS file traversal
+
 `dfind` is a standalone file-finding tool that can enumerate files directly from filesystem metadata tables instead of relying on the normal VFS directory walk.
 
 It currently supports **ext2/ext3/ext4** and **NTFS**.

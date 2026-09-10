@@ -1105,11 +1105,12 @@ static char
 ext_dirent_cheap_type (const struct ext2_dir_entry *dirent)
 {
   /*
-   * Older e2fsprogs headers have struct ext2_dir_entry without a
-   * separate file_type member. When the filesystem filetype feature is
-   * present, libext2fs packs the type into the high byte of name_len.
+   * libext2fs passes a pointer to ext2_dir_entry_2 even though the
+   * callback signature uses ext2_dir_entry. The file_type field is
+   * available in ext2_dir_entry_2.
    */
-  return ext_filetype_char ((dirent->name_len >> 8) & 0xff);
+  const struct ext2_dir_entry_2 *d2 = (const struct ext2_dir_entry_2 *)dirent;
+  return ext_filetype_char (d2->file_type);
 }
 
 static void
@@ -1903,6 +1904,7 @@ struct ntfs_stream_ctx
 {
   ntfs_volume *vol;
   char pathbuf[PATH_MAX];
+  char namebuf[4096]; /* Pre-allocated buffer for filename conversion */
   long depth;
   const struct filters *f;
   time_t now;
@@ -1916,7 +1918,6 @@ static void ntfs_stream_scan_dir (ntfs_volume *vol,
                                   const struct filters *f,
                                   time_t now,
                                   int need_meta);
-
 static int
 ntfs_stream_filldir_cb (void *priv,
                         const ntfschar *name,
@@ -1927,47 +1928,38 @@ ntfs_stream_filldir_cb (void *priv,
                         const unsigned dt_type)
 {
   (void) pos;
-
   struct ntfs_stream_ctx *ctx = priv;
 
-  /* Skip pure DOS names. */
   if (name_type == 2)
     return 0;
 
-  char *mbname = NULL;
-
-  if (ntfs_ucstombs (name, name_len, &mbname, 0) < 0 || !mbname)
+  /* Reuse pre-allocated buffer to avoid malloc/free per file */
+  char *mbname = ctx->namebuf;
+  size_t mbname_cap = sizeof(ctx->namebuf);
+  if (ntfs_ucstombs (name, name_len, &mbname, mbname_cap) < 0 || !mbname)
     return 0;
 
+  int mbname_allocated = (mbname != ctx->namebuf);
+  int ret = 0;
+
   if (strcmp (mbname, ".") == 0 || strcmp (mbname, "..") == 0)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   long child_depth = ctx->depth + 1;
   int out_depth = depth_ok_output (ctx->f, child_depth);
   int rec_depth = depth_ok_recurse (ctx->f, child_depth);
 
   if (!out_depth && !rec_depth)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   char cheap_type = ntfs_dt_type_char (dt_type);
 
-  /*
-   * If caller wants symlinks, do not trust a plain-file dirent type
-   * blindly; NTFS reparse points may need an inode lookup.
-   */
   if (ctx->f->type == 'l' && cheap_type == 'f')
     cheap_type = 0;
 
   char child[PATH_MAX];
   int have_child = 0;
 
-  /* Known directory. */
   if (cheap_type == 'd')
     {
       int candidate = out_depth
@@ -1979,10 +1971,7 @@ ntfs_stream_filldir_cb (void *priv,
           if (ensure_child_path (child, sizeof (child),
                                  ctx->pathbuf, mbname,
                                  &have_child) != 0)
-            {
-              free (mbname);
-              return 0;
-            }
+            goto out;
 
           if (!full_path_filters (ctx->f, child))
             candidate = 0;
@@ -1998,15 +1987,12 @@ ntfs_stream_filldir_cb (void *priv,
                                  &have_child) == 0)
             {
               ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
-
               if (ni)
                 {
                   if (candidate && ctx->need_meta)
                     {
                       struct table_entry e;
-
                       fill_entry_from_ntfs_inode (&e, ni, child);
-
                       if (matches_filters (ctx->f, &e, ctx->now))
                         print_entry (ctx->f, &e);
                     }
@@ -2023,82 +2009,51 @@ ntfs_stream_filldir_cb (void *priv,
             }
         }
 
-      free (mbname);
-      return 0;
+      goto out;
     }
 
-  /* Known non-directory. */
   if (cheap_type != 0)
     {
       if (!out_depth)
-        {
-          free (mbname);
-          return 0;
-        }
+        goto out;
 
       if (!fast_type_ok (ctx->f, cheap_type))
-        {
-          free (mbname);
-          return 0;
-        }
+        goto out;
 
       if (!base_matches (ctx->f, mbname))
-        {
-          free (mbname);
-          return 0;
-        }
+        goto out;
 
       if (ensure_child_path (child, sizeof (child),
                              ctx->pathbuf, mbname, &have_child) != 0)
-        {
-          free (mbname);
-          return 0;
-        }
+        goto out;
 
       if (!full_path_filters (ctx->f, child))
-        {
-          free (mbname);
-          return 0;
-        }
+        goto out;
 
       if (!ctx->need_meta)
         {
           print_fast_path (ctx->f, child);
-          free (mbname);
-          return 0;
+          goto out;
         }
 
       ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
-
       if (ni)
         {
           struct table_entry e;
-
           fill_entry_from_ntfs_inode (&e, ni, child);
-
           if (matches_filters (ctx->f, &e, ctx->now))
             print_entry (ctx->f, &e);
-
           ntfs_inode_close (ni);
         }
 
-      free (mbname);
-      return 0;
+      goto out;
     }
 
-  /* Unknown type. */
   int maybe_output = out_depth && base_matches (ctx->f, mbname);
 
   if (!rec_depth && !maybe_output)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
-  /*
-   * If we are at max depth, need no metadata, have no type filter,
-   * and the name matches, print without opening the MFT record.
-   */
   if (!rec_depth && maybe_output && !ctx->need_meta && !ctx->f->type)
     {
       if (ensure_child_path (child, sizeof (child),
@@ -2107,18 +2062,12 @@ ntfs_stream_filldir_cb (void *priv,
           if (full_path_filters (ctx->f, child))
             print_fast_path (ctx->f, child);
         }
-
-      free (mbname);
-      return 0;
+      goto out;
     }
 
   ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
-
   if (!ni)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   char t = ntfs_inode_type_char (ni);
 
@@ -2144,9 +2093,7 @@ ntfs_stream_filldir_cb (void *priv,
       if (candidate && ctx->need_meta)
         {
           struct table_entry e;
-
           fill_entry_from_ntfs_inode (&e, ni, child);
-
           if (matches_filters (ctx->f, &e, ctx->now))
             print_entry (ctx->f, &e);
         }
@@ -2188,9 +2135,7 @@ ntfs_stream_filldir_cb (void *priv,
           else
             {
               struct table_entry e;
-
               fill_entry_from_ntfs_inode (&e, ni, child);
-
               if (matches_filters (ctx->f, &e, ctx->now))
                 print_entry (ctx->f, &e);
             }
@@ -2198,8 +2143,12 @@ ntfs_stream_filldir_cb (void *priv,
     }
 
   ntfs_inode_close (ni);
-  free (mbname);
-  return 0;
+
+out:
+  if (mbname_allocated)
+    free (mbname);
+
+  return ret;
 }
 
 static void
@@ -2309,6 +2258,7 @@ struct ntfs_buffer_ctx
   ntfs_volume *vol;
   struct table *out;
   char pathbuf[PATH_MAX];
+  char namebuf[4096]; /* Pre-allocated buffer for filename conversion */
   long depth;
   const struct filters *f;
 };
@@ -2331,53 +2281,41 @@ ntfs_buffer_filldir_cb (void *priv,
 {
   (void) pos;
   (void) dt_type;
-
   struct ntfs_buffer_ctx *ctx = priv;
 
   if (name_type == 2)
     return 0;
 
-  char *mbname = NULL;
-
-  if (ntfs_ucstombs (name, name_len, &mbname, 0) < 0 || !mbname)
+  char *mbname = ctx->namebuf;
+  size_t mbname_cap = sizeof(ctx->namebuf);
+  if (ntfs_ucstombs (name, name_len, &mbname, mbname_cap) < 0 || !mbname)
     return 0;
 
+  int mbname_allocated = (mbname != ctx->namebuf);
+  int ret = 0;
+
   if (strcmp (mbname, ".") == 0 || strcmp (mbname, "..") == 0)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   long child_depth = ctx->depth + 1;
   int out_depth = depth_ok_output (ctx->f, child_depth);
   int rec_depth = depth_ok_recurse (ctx->f, child_depth);
 
   if (!out_depth && !rec_depth)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   char child[PATH_MAX];
 
   if (join_path (child, sizeof (child), ctx->pathbuf, mbname) != 0)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   ntfs_inode *ni = ntfs_inode_open (ctx->vol, MREF (mref));
-
   if (!ni)
-    {
-      free (mbname);
-      return 0;
-    }
+    goto out;
 
   if (out_depth)
     {
       struct table_entry e;
-
       fill_entry_from_ntfs_inode (&e, ni, child);
       *table_push (ctx->out) = e;
     }
@@ -2391,8 +2329,12 @@ ntfs_buffer_filldir_cb (void *priv,
     }
 
   ntfs_inode_close (ni);
-  free (mbname);
-  return 0;
+
+out:
+  if (mbname_allocated)
+    free (mbname);
+
+  return ret;
 }
 
 static void
