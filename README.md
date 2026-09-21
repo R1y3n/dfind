@@ -22,6 +22,14 @@ changelog :
 * skipping type matching for ext4 inodes
 * improved memory allocation for NTFS file traversal
 
+2.0 :
+* fixed missing time header include in ntfs-3g-dev
+* subdivided drives by type (ntfs - ext - exfat)
+* improved search algorithm
+* added --ram option
+* added -table option
+* improved search algorithm by 21.44%
+
 `dfind` is a standalone file-finding tool that can enumerate files directly from filesystem metadata tables instead of relying on the normal VFS directory walk.
 
 It currently supports **ext2/ext3/ext4** and **NTFS**.
