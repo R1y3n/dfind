@@ -212,12 +212,7 @@ Experimental / functional.
 The ext4 and NTFS table-based backends have been tested against filesystem images and unmounted filesystems.
 
 
-
-
-
-
-
-changelog : 
+## changelog : 
 
 1.0 :
 * initial release
